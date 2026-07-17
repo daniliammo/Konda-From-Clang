@@ -44,7 +44,7 @@ def найти_транспилятор(явный=None):
     if из_среды and os.path.exists(из_среды):
         return из_среды
     здесь = os.path.dirname(os.path.abspath(__file__))
-    сосед = os.path.join(здесь, "..", "Транспилятор", "Собранное", "Транспилятор")
+    сосед = os.path.join(здесь, "..", "ТранспиляторКонда", "Собранное", "Транспилятор")
     сосед = os.path.normpath(сосед)
     if os.path.exists(сосед):
         return сосед
@@ -60,7 +60,8 @@ def прогнать(транспилятор, текст_конда, имя="п
             fh.write(текст_конда)
         try:
             п = subprocess.run([транспилятор, f"{имя}.конда"], cwd=кат,
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, timeout=120,
+                               errors="replace")
         except (subprocess.TimeoutExpired, OSError):
             return [Диагностика(1, 1, "транспилятор не запустился или завис")]
         диаги = []
