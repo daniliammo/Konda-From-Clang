@@ -380,8 +380,14 @@ class Конвертер:
             return имя_д
         if k == "MemberExpr":
             основа = self.выражение(вн[0]) if вн else ""
+            имя_чл = n.get("name", "?")
+            # Доступ к анонимному union/struct (clang вставляет неявный MemberExpr
+            # с пустым именем) — прозрачен: «m.M.col» = MemberExpr(col) →
+            # MemberExpr("") → MemberExpr(M). Без пропуска вышло бы «m.M..col».
+            if имя_чл == "":
+                return основа
             # p->f и s.f в Konda оба через «.» (кодоген расставит доступ сам)
-            return f"{основа}.{n.get('name', '?')}"
+            return f"{основа}.{имя_чл}"
         if k == "ArraySubscriptExpr":
             # «p[0]» для параметра-ссылки (изменяемый/вывод) — это сам объект:
             # кодоген Konda разыменует его сам.
