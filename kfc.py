@@ -1791,9 +1791,16 @@ def замкнуть_типы(единицы, реф_типы=None):
     (рекурсивно). «реф_типы» — дополнительные затравки: базовые типы
     «изменяемый»/«чтение»-позиций внешних прототипов (rectangle из
     widget_get_allocation). Возвращает множество имён всех известных типов."""
+    # ВАЖНО: RecordDecl без тела (forward-декларация «struct display;») — НЕ
+    # известный тип. Его нельзя эмитить структурой, а если счесть известным, он
+    # выпадет из «внешний тип» и оставит «возможно<display*>» с неопределённым
+    # именем. Такой тип используется только через указатель → он непрозрачный.
+    def _полный(д):
+        if д.get("kind") == "RecordDecl":
+            return bool(д.get("completeDefinition"))
+        return д.get("kind") in ("EnumDecl", "TypedefDecl")
     известные = {д.get("name") for е in единицы for д in е.декларации
-                 if д.get("kind") in ("RecordDecl", "EnumDecl", "TypedefDecl")
-                 and д.get("name")}
+                 if _полный(д) and д.get("name")}
     for е in единицы:
         очередь = [д for д in е.декларации if д.get("kind") == "RecordDecl"]
         for имя_т in (реф_типы or {}).get(id(е), set()):
