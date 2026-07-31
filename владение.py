@@ -100,14 +100,51 @@ def _это_нулевой_индекс(n):
         and n.get("value") == "0"
 
 
+def _цепочка_lvalue_ок(n):
+    """lvalue-цепочка, выразимая ссылкой-проекцией Konda: поля/индексы с КОРНЕМ-
+    ПЕРЕМЕННОЙ («s.f», «s->a.b», «arr[i]»). Транспилятор принимает такие в
+    «изменяемый»/«вывод»/«чтение» (second-class reference; границы — при
+    формировании ссылки). Отвергаем: корень-вызов (временное умерло бы до конца
+    вызова — транспилятор это тоже отвергнет, но не надо и предлагать) и
+    индексацию СЫРОГО указателя (в Konda она за «небезопасно»; массив C — можно:
+    у него в qualType есть «[»)."""
+    шагов = 0
+    while isinstance(n, dict) and шагов < 32:
+        шагов += 1
+        k = n.get("kind")
+        if k == "DeclRefExpr":
+            return True
+        if k == "MemberExpr":
+            вн = n.get("inner") or []
+            if not вн:
+                return False
+            n = _развернуть(вн[0])
+            continue
+        if k == "ArraySubscriptExpr":
+            вн = n.get("inner") or []
+            if len(вн) < 2:
+                return False
+            база = _развернуть(вн[0])
+            qt = ""
+            t = база.get("type") if isinstance(база, dict) else None
+            if isinstance(t, dict):
+                qt = t.get("qualType", "")
+            if "[" not in qt:
+                return False          # указатель, не массив → в Konda небезопасно
+            n = база
+            continue
+        return False
+    return False
+
+
 def адрес_lvalue(арг):
-    """«&переменная» / «&структура.поле» → узел «&», иначе None."""
+    """«&lvalue-цепочка с корнем-переменной» («&x», «&s.f», «&s->a.b»,
+    «&arr[i]») → узел «&», иначе None."""
     a = _развернуть(арг)
     if isinstance(a, dict) and a.get("kind") == "UnaryOperator" \
             and a.get("opcode") == "&":
         внутри = _развернуть((a.get("inner") or [{}])[0])
-        if isinstance(внутри, dict) and внутри.get("kind") in (
-                "DeclRefExpr", "MemberExpr"):
+        if _цепочка_lvalue_ок(внутри):
             return a
     return None
 
