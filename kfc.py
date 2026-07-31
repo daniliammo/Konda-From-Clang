@@ -28,6 +28,7 @@ kfc НЕ делает проверок безопасности — их вып�
                           [--без-проверки] [--итераций N]
                           [--транспилятор ПУТЬ] [-- <флаги clang>]
 """
+import copy
 import json
 import os
 import re
@@ -684,6 +685,14 @@ class Конвертер:
             return
         if d.get("id") in self.владение.пропустить_объявления:
             return          # «T *p = &x» — вместо «p» печатаем «x» (подстановка)
+        if d.get("kind") == "StaticAssertDecl":
+            return          # «_Static_assert» — проверка времени компиляции C;
+                            # рантайм-эффекта нет, аналога в Konda нет — молча снимаем
+        if d.get("kind") == "EnumDecl":
+            # Локальный enum (объявлен в теле функции) — тип верхнего уровня в
+            # Konda. Уже вынесен в top-level декларации пред-проходом
+            # (собрать_локальные_enum), здесь только не печатаем повторно.
+            return
         if d.get("kind") != "VarDecl":
             self.добавить_пометку("проверка-транспилятора", d,
                                  деталь=f"объявление {d.get('kind')} пропущено", ур=ур)
@@ -915,23 +924,32 @@ class Конвертер:
             self.добавить_пометку("проверка-транспилятора", n,
                                  деталь="необычный switch", ур=ур)
             return
-        группы, тек = [], None      # тек = (значения[], операторы[])
+        группы, тек = [], None      # тек = (значения[] | None, операторы[])
         падение = False
         for c in тело.get("inner", []):
             k = c.get("kind")
             if k in ("CaseStmt", "DefaultStmt"):
-                # стек «case A: case B:» — CaseStmt вложены
-                значения, под = [], c
-                while под.get("kind") == "CaseStmt":
+                # clang вкладывает подряд идущие метки как substatement
+                # предыдущей: «case A: case B: default: stmt». Разворачиваем ВСЕ
+                # метки группы, спускаясь и через CaseStmt, и через DefaultStmt —
+                # иначе состекованная метка (например «default: case X:») утекала
+                # бы в операторы группы и ложно детектилась как провал.
+                значения, есть_default, под = [], False, c
+                while isinstance(под, dict) and \
+                        под.get("kind") in ("CaseStmt", "DefaultStmt"):
                     пвн = под.get("inner", [])
-                    значения.append(self.выражение(пвн[0]))
-                    под = пвн[-1] if len(пвн) > 1 else {}
-                if c.get("kind") == "DefaultStmt":
-                    значения = None
-                    под = c.get("inner", [{}])[-1] if c.get("inner") else {}
+                    if под.get("kind") == "DefaultStmt":
+                        есть_default = True
+                        под = пвн[-1] if пвн else {}
+                    else:
+                        значения.append(self.выражение(пвн[0]))
+                        под = пвн[-1] if len(пвн) > 1 else {}
+                # default ловит все значения → это ветка «иначе»; явные case,
+                # состекованные с default, избыточны (default их и так покрывает).
+                ярлык = None if есть_default else значения
                 if тек is not None and тек[1] and not _завершён(тек[1]):
                     падение = True
-                тек = (значения, [])
+                тек = (ярлык, [])
                 группы.append(тек)
                 if под and "kind" in под:
                     тек[1].append(под)
@@ -1046,9 +1064,31 @@ class Конвертер:
 
     def перечисление(self, d):
         имя = d.get("name")
-        if not имя:                             # анонимный enum — вынести как конст? пропуск
-            self.добавить_пометку("проверка-транспилятора", d,
-                                 деталь="анонимный enum — задайте имя или используйте «конст»")
+        if not имя:
+            # Анонимный enum в C — просто именованные целочисленные константы.
+            # В Konda перечисление обязано иметь имя, поэтому разворачиваем в
+            # глобальные «конст целое32 ИМЯ = знач» (тот же смысл, статически
+            # иммутабельны). Значения: явные — как есть, авто — счётчик (+1).
+            счётчик = 0
+            есть = False
+            for c in d.get("inner", []):
+                if c.get("kind") != "EnumConstantDecl":
+                    continue
+                есть = True
+                вн = [x for x in c.get("inner", [])
+                      if isinstance(x, dict) and "kind" in x]
+                if вн:
+                    знач = self.выражение(вн[-1])
+                    self._строка(f"конст целое32 {c.get('name')} = {знач}")
+                    try:                        # обновить счётчик для авто-констант ниже
+                        счётчик = int(знач, 0) + 1
+                    except (ValueError, TypeError):
+                        счётчик += 1
+                else:
+                    self._строка(f"конст целое32 {c.get('name')} = {счётчик}")
+                    счётчик += 1
+            if есть:
+                self._строка("")
             return
         self._строка(f"перечисление {имя} {{")
         for c in d.get("inner", []):
@@ -1078,6 +1118,10 @@ class Конвертер:
         основа = без_квалификаторов(qt)
         if основа.startswith(("struct ", "union ", "enum ")):
             return                              # struct X {…} typedef — структура уже вышла
+        # Псевдоним примитива/массива (typedef float GLfloat): в Konda alias для
+        # примитива нет. Использования пока НЕ разворачиваются (это потребовало бы
+        # десугаринга типов по всему файлу — отдельная задача), поэтому честно
+        # помечаем: тип-псевдоним останется неразрешённым.
         self.добавить_пометку("typedef-алиас", d,
                              деталь=f"«{имя}» = «{основа}» → «{конда_тип(qt)}»")
         self._строка("")
@@ -1232,10 +1276,52 @@ class Конвертер:
 
 
 # ─── драйвер ─────────────────────────────────────────────────────────────────
+# Функции, которые НЕ возвращают управление (диверджентные) — вызов такой
+# завершает поток не хуже break/return, поэтому провала (fallthrough) в
+# следующий case нет. Без этого «case X: …; exit(1);» ложно помечался как провал.
+_РАСХОДЯЩИЕСЯ = {
+    "exit", "_exit", "_Exit", "quick_exit", "abort", "__builtin_unreachable",
+    "__builtin_trap", "longjmp", "siglongjmp", "err", "errx", "verr", "verrx",
+    "pthread_exit",
+}
+
+
+def _имя_вызова(n):
+    """Имя вызываемой функции у CallExpr (сквозь ImplicitCast/Paren), иначе ''."""
+    if not isinstance(n, dict):
+        return ""
+    вн = n.get("inner", [])
+    if not вн:
+        return ""
+    ф = вн[0]
+    while isinstance(ф, dict) and ф.get("kind") in (
+            "ImplicitCastExpr", "ParenExpr", "CStyleCastExpr"):
+        вд = ф.get("inner", [])
+        if not вд:
+            return ""
+        ф = вд[0]
+    if isinstance(ф, dict) and ф.get("kind") == "DeclRefExpr":
+        return (ф.get("referencedDecl") or {}).get("name", "")
+    return ""
+
+
+def _расходится(c):
+    """Оператор — вызов диверджентной функции (exit/abort/…)?"""
+    if not isinstance(c, dict):
+        return False
+    if c.get("kind") == "CallExpr":
+        return _имя_вызова(c) in _РАСХОДЯЩИЕСЯ
+    # выражение-оператор оборачивает CallExpr напрямую
+    return False
+
+
 def _завершён(операторы):
-    """Заканчивается ли список операторов на break/return/continue."""
+    """Заканчивается ли список операторов терминатором потока: break/return/
+    continue или вызов диверджентной функции (exit/abort/…)."""
     for c in reversed(операторы):
         if c.get("kind") in ("BreakStmt", "ReturnStmt", "ContinueStmt"):
+            return True
+        if _расходится(c):
             return True
         if c.get("kind") in ("CaseStmt", "DefaultStmt"):
             continue
@@ -1683,6 +1769,33 @@ def _перепривязать_id(узлы, префикс):
         обход(д)
 
 
+def собрать_локальные_enum(декларации):
+    """EnumDecl, объявленные ВНУТРИ функций (локальный тип), — в Konda enum
+    живёт только на верхнем уровне. Возвращает такие узлы (именованные, с
+    полным определением) для выноса наверх; дубли по имени отсеиваются."""
+    out, имена = [], set()
+    def обход(n, внутри_функции):
+        if not isinstance(n, dict):
+            return
+        k = n.get("kind")
+        # У ЛОКАЛЬНОГО enum clang не ставит completeDefinition — определением
+        # считаем наличие хотя бы одной EnumConstantDecl.
+        есть_конст = any(isinstance(c, dict) and c.get("kind") == "EnumConstantDecl"
+                         for c in n.get("inner", []))
+        if k == "EnumDecl" and внутри_функции and n.get("name") \
+                and есть_конст and n.get("name") not in имена:
+            имена.add(n["name"])
+            # Глубокая копия: тот же узел остаётся в теле функции (объявление()
+            # его пропустит), а наверх идёт независимая копия — иначе
+            # _перепривязать_id дважды префиксует общий id.
+            out.append(copy.deepcopy(n))
+        for c in n.get("inner", []):
+            обход(c, внутри_функции or k == "FunctionDecl")
+    for д in декларации:
+        обход(д, False)
+    return out
+
+
 class Единица:
     """Один .c-файл проекта: AST, исходник, карта узлов и результат эмиссии."""
 
@@ -1692,8 +1805,12 @@ class Единица:
         корень = дамп_clang(путь, доп, игнорировать_clang)
         база = os.path.basename(путь)
         # типы из заголовков проекта — ПЕРЕД объявлениями самого файла
+        главные = list(главные_объявления(корень, база))
+        # Локальные (объявленные в теле функций) enum — тип верхнего уровня в
+        # Konda: выносим наверх (в теле объявление() их пропускает).
+        локальные_enum = собрать_локальные_enum(главные)
         self.декларации = (list(типы_из_локальных_заголовков(корень, база))
-                           + list(главные_объявления(корень, база)))
+                           + локальные_enum + главные)
         # Базовые имена заголовков, ЧЬИ СТРУКТУРЫ/перечисления kfc переэмитит
         # (мф_счёт.h → структура Счёт): их #include НЕ переносим — анонимный
         # C-typedef структуры («typedef struct {…} Счёт») при повторном
