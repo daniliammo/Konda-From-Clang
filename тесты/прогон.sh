@@ -281,4 +281,13 @@ if grep -q "небезопасно { add_listener" "$TMP/ли.конда"; then
 fi
 echo "  ок: проекции и типизированный void* работают"
 
+python3 "$ROOT/kfc.py" "$ROOT/примеры/конфиг.c" -o "$TMP/кф.конда" 2>"$TMP/кф.log"
+grep -q "пометок: 0" "$TMP/кф.log" \
+    || { echo "  ОШИБКА: out-указатель char** должен переводиться без пометок"; cat "$TMP/кф.log"; exit 1; }
+grep -q "изменяемый символ\* value" "$TMP/кф.конда" \
+    || { echo "  ОШИБКА: «char **value» должен стать «изменяемый символ*»"; exit 1; }
+grep -q "config_get_string(c, \"ключ\", out," "$TMP/кф.конда" \
+    || { echo "  ОШИБКА: «&out» должен сниматься на вызове (T** out-указатель)"; exit 1; }
+echo "  ок: T** out-указатель (weston_config-паттерн) переведён"
+
 echo "OK: все проверки прошли"
