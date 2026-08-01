@@ -1259,14 +1259,13 @@ class Конвертер:
         возвр_ничего = (self.тип_возврата == "ничего")
         if not возвр_ничего and хвост[-1].get("kind") != "ReturnStmt":
             return None
-        # хвост НЕ должен ссылаться на локали функции (только параметры/глобали) —
-        # иначе вынос требовал бы сложной передачи локального состояния.
-        локали = set()
-        for c in внутр[:li]:
+        # Локали, объявленные до метки (могут понадобиться cleanup-у).
+        локаль_декл = {}      # имя → (VarDecl, индекс_оператора)
+        for i, c in enumerate(внутр[:li]):
             if c.get("kind") == "DeclStmt":
                 for d in c.get("inner", []):
                     if isinstance(d, dict) and d.get("kind") == "VarDecl" and d.get("name"):
-                        локали.add(d["name"])
+                        локаль_декл[d["name"]] = (d, i)
         имена = set()
         def собрать_имена(n):
             if isinstance(n, dict):
@@ -1278,24 +1277,45 @@ class Конвертер:
                     собрать_имена(c)
         for x in хвост:
             собрать_имена(x)
-        if имена & локали:
-            return None
+        # Индекс первого top-level оператора, содержащего goto (для проверки
+        # definite-assignment передаваемых локалей: они обязаны быть определены
+        # ДО любого goto, иначе передача — использование до инициализации).
+        def _есть_goto(n):
+            if isinstance(n, dict):
+                if n.get("kind") == "GotoStmt":
+                    return True
+                return any(_есть_goto(c) for c in n.get("inner", []))
+            return False
+        первый_goto = next((i for i, c in enumerate(внутр) if _есть_goto(c)),
+                           len(внутр))
         # Параметры, на которые ссылается хвост, — параметры хелпера с ТЕМ ЖЕ
         # объявлением (возможно/изменяемый/вывод сохраняем 1:1 из основной
-        # функции; передача параметра-lvalue как ref-аргумента корректна). Срез в
-        # cleanup не поддерживаем (владение/освобождение сложнее) — bail.
-        парамы = [c for c in f.get("inner", []) if c.get("kind") == "ParmVarDecl"]
+        # функции). Локали cleanup-а — по значению (объявлены с инициализатором
+        # до первого goto, не срез). Срез (параметр или локаль) в cleanup не
+        # поддерживаем (владение/освобождение сложнее) — bail.
+        парамы = {p.get("name"): p for p in f.get("inner", [])
+                  if p.get("kind") == "ParmVarDecl" and p.get("name")}
         исп = []
-        for p in парамы:
-            имя_п = p.get("name")
-            if not имя_п or имя_п not in имена:
-                continue
-            if имя_п in self.срез_переменные:
-                return None
-            декл = self.декл_параметра.get(имя_п)
-            if not декл:
-                return None
-            исп.append((имя_п, декл))
+        for имя_р in имена:
+            if имя_р in парамы:
+                if имя_р in self.срез_переменные:
+                    return None
+                декл = self.декл_параметра.get(имя_р)
+                if not декл:
+                    return None
+                исп.append((имя_р, декл))
+            elif имя_р in локаль_декл:
+                vd, поз = локаль_декл[имя_р]
+                if поз >= первый_goto:
+                    return None      # локаль объявлена после goto — не определена
+                иниц = [x for x in vd.get("inner", [])
+                        if isinstance(x, dict) and "kind" in x]
+                if not иниц:
+                    return None      # без инициализатора — use-before-init на goto
+                if self._malloc_в_срез(имя_р, qualtype(vd), иниц[-1]) is not None:
+                    return None      # локаль-срез — владение сложнее
+                исп.append((имя_р, f"{конда_тип(qualtype(vd))} {имя_р}"))
+            # иначе (глобаль/функция/строка-литерал) — передавать не нужно
         return {
             "declid": declid,
             "имя_метки": метка.get("name", "cleanup"),
@@ -1324,7 +1344,14 @@ class Конвертер:
             if декл.startswith(("изменяемый ", "вывод ", "чтение ")):
                 self.ссылочные_имена.add(имя)
         парам_стр = ", ".join(декл for _, декл in gc["параметры"])
-        тип = "ничего" if gc["возвр_ничего"] else self.тип_возврата
+        # Тип возврата — как у основной функции (в т.ч. возможно<T*>, иначе
+        # «вернуть нуль» в хвосте не пройдёт по nullable-типу).
+        if gc["возвр_ничего"]:
+            тип = "ничего"
+        elif self.возврат_возможно:
+            тип = f"возможно<{self.тип_возврата}>"
+        else:
+            тип = self.тип_возврата
         self._строка(f"{тип} {gc['helper']}(" + парам_стр + ")")
         self._строка("{")
         for x in gc["хвост"]:
