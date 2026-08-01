@@ -325,4 +325,12 @@ grep -qw "constraints" "$TMP/кв.конда" \
     || { echo "  ОШИБКА: имя типа «constraints» потеряно"; cat "$TMP/кв.конда"; exit 1; }
 echo "  ок: квалификаторы снимаются по границам слов"
 
+echo "== детектор double-free: free(x->поле) НЕ путается со свободой самой x =="
+python3 "$ROOT/kfc.py" "$ROOT/примеры/free_поле.c" --без-проверки -o "$TMP/fp.конда" 2>"$TMP/fp.log"
+grep -q "пометок: 0" "$TMP/fp.log" \
+    || { echo "  ОШИБКА: free(w->buffers)+free(w) не должно давать пометок"; cat "$TMP/fp.log"; exit 1; }
+grep -q "двойной-free" "$TMP/fp.конда" \
+    && { echo "  ОШИБКА: ложный double-free на free(поле) + free(корень)"; exit 1; }
+echo "  ок: освобождение проекции не считается повтором самого объекта"
+
 echo "OK: все проверки прошли"
