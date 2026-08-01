@@ -118,7 +118,9 @@ def qualtype(n) -> str:
 
 
 def без_квалификаторов(t: str) -> str:
-    t = t.replace("const", " ").replace("volatile", " ").replace("restrict", " ")
+    # Границы слов: иначе «const» внутри «constraints» → « raints» (порча имени
+    # типа). Убираем только отдельные квалификаторы.
+    t = re.sub(r"\b(const|volatile|restrict)\b", " ", t)
     return " ".join(t.split())
 
 
@@ -584,6 +586,16 @@ class Конвертер:
             self.эмит(ур, "продолжить")
             return
         if k == "GotoStmt":
+            gc = self.goto_cleanup
+            if gc and n.get("targetLabelDeclId") == gc["declid"]:
+                аргс = ", ".join(имя for имя, _ in gc["параметры"])
+                вызов = f"{gc['helper']}({аргс})"
+                if gc["возвр_ничего"]:
+                    self.эмит(ур, вызов)
+                    self.эмит(ур, "вернуть")
+                else:
+                    self.эмит(ур, f"вернуть {вызов}")
+                return
             self.добавить_пометку("goto", n, ур=ур)
             return
         if k in ("LabelStmt",):
@@ -1193,6 +1205,126 @@ class Конвертер:
             return True
         return any(self._имя_в_арифметике(имя, c) for c in n.get("inner", []))
 
+    def _обнаружить_goto_очистку(self, f, тело):
+        """Паттерн «goto cleanup» (16 из 17 функций weston с goto): ОДНА метка в
+        хвосте функции, ВСЕ goto ведут в неё, перед меткой — терминатор (return,
+        нет проваливания в метку), хвост завершается return, и хвост ссылается
+        только на ПАРАМЕТРЫ (не на локали функции). Такой хвост можно вынести в
+        отдельную функцию «goto_<имя>», а каждый goto → «вернуть goto_<имя>(…)».
+        → dict описания выноса, иначе None.
+
+        Konda не имеет goto; это структурное переписывание в ранний выход
+        (autofree сам освобождает срезы на выходе, поэтому cleanup-хвост обычно
+        сводится к вызовам libc/проектных функций + return-кода)."""
+        внутр = [c for c in тело.get("inner", []) if isinstance(c, dict)]
+        метки = [(i, c) for i, c in enumerate(внутр) if c.get("kind") == "LabelStmt"]
+        if len(метки) != 1:
+            return None
+        li, метка = метки[0]
+        declid = метка.get("declId")
+        if not declid or li == 0:
+            return None
+        # все goto функции ведут именно в эту метку
+        gotos = []
+        def собрать_goto(n):
+            if isinstance(n, dict):
+                if n.get("kind") == "GotoStmt":
+                    gotos.append(n)
+                for c in n.get("inner", []):
+                    собрать_goto(c)
+        собрать_goto(f)
+        if not gotos or any(g.get("targetLabelDeclId") != declid for g in gotos):
+            return None
+        # перед меткой — явный return (в метку не проваливаются на нормальном пути)
+        if внутр[li - 1].get("kind") != "ReturnStmt":
+            return None
+        # хвост = первый оператор метки + всё после неё
+        хвост = [x for x in (метка.get("inner") or []) if isinstance(x, dict)]
+        хвост += [x for x in внутр[li + 1:] if isinstance(x, dict)]
+        if not хвост:
+            return None
+        возвр_ничего = (self.тип_возврата == "ничего")
+        if not возвр_ничего and хвост[-1].get("kind") != "ReturnStmt":
+            return None
+        # хвост НЕ должен ссылаться на локали функции (только параметры/глобали) —
+        # иначе вынос требовал бы сложной передачи локального состояния.
+        локали = set()
+        for c in внутр[:li]:
+            if c.get("kind") == "DeclStmt":
+                for d in c.get("inner", []):
+                    if isinstance(d, dict) and d.get("kind") == "VarDecl" and d.get("name"):
+                        локали.add(d["name"])
+        имена = set()
+        def собрать_имена(n):
+            if isinstance(n, dict):
+                if n.get("kind") == "DeclRefExpr":
+                    rn = (n.get("referencedDecl") or {}).get("name")
+                    if rn:
+                        имена.add(rn)
+                for c in n.get("inner", []):
+                    собрать_имена(c)
+        for x in хвост:
+            собрать_имена(x)
+        if имена & локали:
+            return None
+        # Параметры, на которые ссылается хвост, — параметры хелпера с ТЕМ ЖЕ
+        # объявлением (возможно/изменяемый/вывод сохраняем 1:1 из основной
+        # функции; передача параметра-lvalue как ref-аргумента корректна). Срез в
+        # cleanup не поддерживаем (владение/освобождение сложнее) — bail.
+        парамы = [c for c in f.get("inner", []) if c.get("kind") == "ParmVarDecl"]
+        исп = []
+        for p in парамы:
+            имя_п = p.get("name")
+            if not имя_п or имя_п not in имена:
+                continue
+            if имя_п in self.срез_переменные:
+                return None
+            декл = self.декл_параметра.get(имя_п)
+            if not декл:
+                return None
+            исп.append((имя_п, декл))
+        return {
+            "declid": declid,
+            "имя_метки": метка.get("name", "cleanup"),
+            "helper": f"goto_{self.тек_исходное_имя}",
+            "хвост": хвост,
+            "li_id": метка.get("id"),
+            "параметры": исп,     # [(имя, полное_объявление)]
+            "возвр_ничего": возвр_ничего,
+        }
+
+    def _эмит_goto_хелпер(self, gc):
+        """Эмитит функцию-хвост «goto_<имя>(параметры)» с телом cleanup-метки.
+        Вызывается ПОСЛЕ основной функции (транспилятор разрешает прямые ссылки
+        через signature-pass). Своё окружение: параметры сырые (по значению),
+        без ссылок/срезов/подстановок."""
+        сохр = (self.ссылочные_имена, self.срез_переменные, self.подстановки,
+                self.переименования, self.goto_cleanup, self.внутри_небезопасно,
+                self.освобождённые_срезы)
+        self.ссылочные_имена = set(); self.срез_переменные = set()
+        self.подстановки = {}; self.переименования = {}
+        self.goto_cleanup = None; self.внутри_небезопасно = False
+        self.освобождённые_срезы = set()
+        # ref-параметры (изменяемый/вывод) в хелпере — их тела разыменовывают
+        # безопасно; отметим, чтобы эмиссия не заворачивала в «небезопасно».
+        for имя, декл in gc["параметры"]:
+            if декл.startswith(("изменяемый ", "вывод ", "чтение ")):
+                self.ссылочные_имена.add(имя)
+        парам_стр = ", ".join(декл for _, декл in gc["параметры"])
+        тип = "ничего" if gc["возвр_ничего"] else self.тип_возврата
+        self._строка(f"{тип} {gc['helper']}(" + парам_стр + ")")
+        self._строка("{")
+        for x in gc["хвост"]:
+            self.оператор(x, 1)
+        if gc["возвр_ничего"] and (not gc["хвост"]
+                                   or gc["хвост"][-1].get("kind") != "ReturnStmt"):
+            self.эмит(1, "вернуть")
+        self._строка("}")
+        self._строка("")
+        (self.ссылочные_имена, self.срез_переменные, self.подстановки,
+         self.переименования, self.goto_cleanup, self.внутри_небезопасно,
+         self.освобождённые_срезы) = сохр
+
     def функция(self, f):
         # Таблица владения ключуется ИСХОДНЫМ именем C — берём его до
         # переименования точки входа, иначе подстановки для main не найдутся.
@@ -1207,6 +1339,7 @@ class Конвертер:
         self.ссылочные_имена = set()
         self.подстановки = self.владение.подстановки_функции(исходное_имя)
         self.переименования = {}
+        self.goto_cleanup = None
         self.тек_функция = имя
         тело = next((c for c in f.get("inner", []) if c.get("kind") == "CompoundStmt"), None)
         # Точка входа: транспилятор жёстко именует параметры main как
@@ -1221,6 +1354,7 @@ class Конвертер:
                 if c.get("name"):
                     self.переименования[c["name"]] = канон_вход[i]
         параметры = []
+        self.декл_параметра = {}   # сырое_имя → полное объявление (для goto-хелпера)
         индекс_п = -1
         for c in f.get("inner", []):
             if c.get("kind") != "ParmVarDecl":
@@ -1254,6 +1388,7 @@ class Конвертер:
                 параметры.append(f"возможно<{kt}> {pимя}")
             else:
                 параметры.append(f"{kt} {pимя}")
+            self.декл_параметра[сырое_имя] = параметры[-1]
         if имя == "точка_входа" and not параметры:
             параметры = ["целое32 количество_аргументов", "символ** аргументы"]
         тип_в_заголовке = (f"возможно<{self.тип_возврата}>"
@@ -1289,10 +1424,20 @@ class Конвертер:
                                             "небезопасного тела — добавьте «вернуть»",
                                      ур=1)
         else:
+            # goto-cleanup: выносим хвост-метку в функцию «goto_<имя>», а сами
+            # goto → «вернуть goto_<имя>(…)». Метку и её хвост в основном теле
+            # не печатаем (они уехали в хелпер).
+            self.goto_cleanup = self._обнаружить_goto_очистку(f, тело)
+            стоп_id = self.goto_cleanup["li_id"] if self.goto_cleanup else None
             for c in тело.get("inner", []):
+                if стоп_id is not None and c.get("id") == стоп_id:
+                    break        # метка и всё после неё — в хелпере
                 self.оператор(c, 1)
         self._строка("}")
         self._строка("")
+        if self.goto_cleanup:
+            self._эмит_goto_хелпер(self.goto_cleanup)
+            self.goto_cleanup = None
 
 
 # ─── драйвер ─────────────────────────────────────────────────────────────────

@@ -300,4 +300,29 @@ grep -q "config_get_string(c, \"ключ\", out," "$TMP/кф.конда" \
     || { echo "  ОШИБКА: «&out» должен сниматься на вызове (T** out-указатель)"; exit 1; }
 echo "  ок: T** out-указатель (weston_config-паттерн) переведён"
 
+echo "== goto cleanup → функция «goto_<имя>» + ранний «вернуть goto_<имя>(…)» =="
+python3 "$ROOT/kfc.py" "$ROOT/примеры/goto_очистка.c" -o "$TMP/gc.конда" 2>"$TMP/gc.log"
+grep -q "пометок: 0" "$TMP/gc.log" \
+    || { echo "  ОШИБКА: goto-cleanup должен переводиться без пометок"; cat "$TMP/gc.log"; exit 1; }
+grep -q "вернуть goto_настроить(р)" "$TMP/gc.конда" \
+    || { echo "  ОШИБКА: goto ошибка → «вернуть goto_настроить(р)»"; exit 1; }
+grep -qE "целое32 goto_настроить\((изменяемый )?ресурс р\)" "$TMP/gc.конда" \
+    || { echo "  ОШИБКА: хвост-метка должна вынестись в функцию goto_настроить"; cat "$TMP/gc.конда"; exit 1; }
+grep -q "KONDA-TODO.*goto" "$TMP/gc.конда" \
+    && { echo "  ОШИБКА: goto-пометок остаться не должно"; exit 1; }
+echo "  ок: goto-cleanup вынесен в goto_<имя>, переходы стали ранним возвратом"
+check goto_очистка "rc=0 занят=1"
+
+echo "== имя типа со «const» внутри не рушится (constraints ≠ raints) =="
+cat > "$TMP/кв.c" <<'CEOF'
+struct constraints { int x; };
+int работа(struct constraints *c) { return c->x; }
+CEOF
+python3 "$ROOT/kfc.py" "$TMP/кв.c" --без-проверки -o "$TMP/кв.конда" 2>/dev/null
+grep -qw "raints" "$TMP/кв.конда" \
+    && { echo "  ОШИБКА: «const» вырезан внутри «constraints» → порча имени типа"; cat "$TMP/кв.конда"; exit 1; }
+grep -qw "constraints" "$TMP/кв.конда" \
+    || { echo "  ОШИБКА: имя типа «constraints» потеряно"; cat "$TMP/кв.конда"; exit 1; }
+echo "  ок: квалификаторы снимаются по границам слов"
+
 echo "OK: все проверки прошли"
