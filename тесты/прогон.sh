@@ -367,4 +367,44 @@ if [ -x "$TRBIN" ]; then
 fi
 echo "  ок: else-if стал плоской цепочкой «иначе если» и работает"
 
+echo "== const-глобалы → «конст» (иммутабельные; изменяемый указатель — без конст) =="
+cat > "$TMP/globc.c" <<'EOF'
+#include <stdio.h>
+struct Т { int x; };
+static const int РАЗМЕР = 32;
+static const int ТАБЛ[3] = {1,2,3};
+static const struct Т НАЧ = { .x = 7 };
+static const char *ИМЯ = "app";
+static const char *CUR[2] = {"a","b"};
+static const char *текущий = "a";
+void set(void){ текущий = "b"; }
+int main(void){ printf("%d %d %d %s %s\n", РАЗМЕР, ТАБЛ[2], НАЧ.x, ИМЯ, CUR[1]); return 0; }
+EOF
+python3 "$ROOT/kfc.py" "$TMP/globc.c" --без-проверки -o "$TMP/globc.конда" 2>/dev/null
+for g in "конст целое32 РАЗМЕР" "конст целое32 ТАБЛ\[3\]" "конст Т НАЧ" "конст символ\* ИМЯ" "конст символ\* CUR\[2\]"; do
+    grep -qE "^$g" "$TMP/globc.конда" || { echo "  ОШИБКА: нет «$g»"; cat "$TMP/globc.конда"; exit 1; }
+done
+grep -qE "^конст символ\* текущий" "$TMP/globc.конда" \
+    && { echo "  ОШИБКА: переприсваиваемый указатель НЕ должен быть конст"; exit 1; }
+# Транспиляция иммутабельной части — на отдельном чистом файле (без mutable-глобала).
+cat > "$TMP/globc2.c" <<'EOF'
+#include <stdio.h>
+struct Т { int x; };
+static const int РАЗМЕР = 32;
+static const int ТАБЛ[3] = {1,2,3};
+static const struct Т НАЧ = { .x = 7 };
+static const char *ИМЯ = "app";
+static const char *CUR[2] = {"a","b"};
+int main(void){ printf("%d %d %d %s %s\n", РАЗМЕР, ТАБЛ[2], НАЧ.x, ИМЯ, CUR[1]); return 0; }
+EOF
+python3 "$ROOT/kfc.py" "$TMP/globc2.c" --без-проверки -o "$TMP/globc2.конда" 2>/dev/null
+if [ -x "$TRBIN" ]; then
+    cp "$TMP/globc2.конда" "$TR/_smoke_globc.конда"
+    ( cd "$TR" && ./Собранное/ТранспиляторКонда "_smoke_globc.конда" >/dev/null 2>&1 ) \
+        || { rm -f "$TR/_smoke_globc.конда"; echo "  ОШИБКА: конст-глобалы не транспилируются"; cat "$TMP/globc2.конда"; exit 1; }
+    out="$("$TR/вывод/_smoke_globc.elf" 2>&1)"; rm -f "$TR/_smoke_globc.конда"
+    [ "$out" = "32 3 7 app b" ] || { echo "  ОШИБКА вывода конст-глобалов: «$out»"; exit 1; }
+fi
+echo "  ок: const-глобалы (скаляр/массив/структура/строка/строк-массив) → конст"
+
 echo "OK: все проверки прошли"
