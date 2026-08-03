@@ -1,0 +1,30 @@
+#содержит <GL/glut.h>
+#содержит <stdio.h>
+#содержит <stdlib.h>
+
+внешняя ничего glutInit(изменяемый целое32 pargc, символ** argv)
+типфункции ничего glutDisplayFunc_callback()
+внешняя ничего glutDisplayFunc(glutDisplayFunc_callback callback)
+
+ничего display()
+{
+    glClear(16384)
+    glBegin(4)
+    glColor3f(1, 0, 0)
+    glVertex2f(-0.5, -0.5)
+    glColor3f(0, 1, 0)
+    glVertex2f(0.5, -0.5)
+    glColor3f(0, 0, 1)
+    glVertex2f(0, 0.5)
+    glEnd()
+    glFlush()
+}
+
+целое32 точка_входа(целое32 количество_аргументов, символ** аргументы)
+{
+    glutInit(количество_аргументов, аргументы)
+    glutCreateWindow("Простой треугольник OpenGL")
+    glutDisplayFunc(display)
+    glutMainLoop()
+    вернуть 0
+}
