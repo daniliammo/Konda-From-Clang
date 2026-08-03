@@ -344,4 +344,27 @@ grep -qE "целое32 goto_настроить\(изменяемый рес р, 
 echo "  ок: cleanup-локаль (с инициализатором до goto) уехала в хелпер"
 check goto_локаль "rc=0 busy=1"
 
+echo "== «else if» → плоская цепочка «иначе если» (не вложенное иначе{если}) =="
+cat > "$TMP/elseif.c" <<'EOF'
+#include <stdio.h>
+int classify(int x) {
+    if (x < 0) return -1;
+    else if (x == 0) return 0;
+    else if (x < 10) return 1;
+    else return 2;
+}
+int main(void){ printf("%d%d%d%d\n", classify(-5),classify(0),classify(5),classify(50)); return 0; }
+EOF
+python3 "$ROOT/kfc.py" "$TMP/elseif.c" --без-проверки -o "$TMP/elseif.конда" 2>/dev/null
+n=$(grep -c "иначе если" "$TMP/elseif.конда")
+[ "$n" -eq 2 ] || { echo "  ОШИБКА: ожидалось 2 «иначе если», получено $n"; cat "$TMP/elseif.конда"; exit 1; }
+if [ -x "$TRBIN" ]; then
+    cp "$TMP/elseif.конда" "$TR/_smoke_elseif.конда"
+    ( cd "$TR" && ./Собранное/ТранспиляторКонда "_smoke_elseif.конда" >/dev/null 2>&1 ) \
+        || { rm -f "$TR/_smoke_elseif.конда"; echo "  ОШИБКА: цепочка иначе-если не транспилируется"; exit 1; }
+    out="$("$TR/вывод/_smoke_elseif.elf" 2>&1)"; rm -f "$TR/_smoke_elseif.конда"
+    [ "$out" = "-1012" ] || { echo "  ОШИБКА вывода иначе-если: «$out» ≠ «-1012»"; exit 1; }
+fi
+echo "  ок: else-if стал плоской цепочкой «иначе если» и работает"
+
 echo "OK: все проверки прошли"
