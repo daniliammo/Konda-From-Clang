@@ -407,6 +407,28 @@ if [ -x "$TRBIN" ]; then
 fi
 echo "  ок: const-глобалы (скаляр/массив/структура/строка/строк-массив) → конст"
 
+echo "== изменяемый целочисленный глобал → атом<T> (static _Atomic) =="
+cat > "$TMP/gatom.c" <<'EOF'
+#include <stdio.h>
+static int счётчик = 0;
+static _Bool opt_help = 0;
+void bump(void){ счётчик++; opt_help = 1; }
+int main(void){ bump(); printf("%d %d\n", счётчик, (int)opt_help); return 0; }
+EOF
+python3 "$ROOT/kfc.py" "$TMP/gatom.c" --без-проверки -o "$TMP/gatom.конда" 2>/dev/null
+grep -qE "^атом<целое32> счётчик" "$TMP/gatom.конда" \
+    || { echo "  ОШИБКА: изменяемый int-глобал → атом<целое32>"; cat "$TMP/gatom.конда"; exit 1; }
+grep -qE "^атом<логический> opt_help" "$TMP/gatom.конда" \
+    || { echo "  ОШИБКА: изменяемый _Bool-глобал → атом<логический>"; exit 1; }
+if [ -x "$TRBIN" ]; then
+    cp "$TMP/gatom.конда" "$TR/_smoke_gatom.конда"
+    ( cd "$TR" && ./Собранное/ТранспиляторКонда "_smoke_gatom.конда" >/dev/null 2>&1 ) \
+        || { rm -f "$TR/_smoke_gatom.конда"; echo "  ОШИБКА: атом-глобалы не транспилируются"; exit 1; }
+    out="$("$TR/вывод/_smoke_gatom.elf" 2>&1)"; rm -f "$TR/_smoke_gatom.конда"
+    [ "$out" = "1 1" ] || { echo "  ОШИБКА вывода атом-глобалов: «$out»"; exit 1; }
+fi
+echo "  ок: изменяемый целочисленный глобал → атом<T>, транспилируется"
+
 echo "== одиночный alloc структуры (не убегает) → Ящик<T>; убегающий — сырой =="
 cat > "$TMP/box.c" <<'EOF'
 #include <stdio.h>
