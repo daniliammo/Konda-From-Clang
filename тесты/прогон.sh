@@ -407,4 +407,35 @@ if [ -x "$TRBIN" ]; then
 fi
 echo "  ок: const-глобалы (скаляр/массив/структура/строка/строк-массив) → конст"
 
+echo "== одиночный alloc структуры (не убегает) → Ящик<T>; убегающий — сырой =="
+cat > "$TMP/box.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+struct Окно { int w; int h; };
+void расширить(struct Окно *o);
+int local_case(void) {
+    struct Окно *o = malloc(sizeof *o);   // не убегает → Ящик
+    o->w = 640; o->h = 480;
+    int s = o->w + o->h;
+    free(o);
+    return s;
+}
+void escape_case(void) {
+    struct Окно *o = malloc(sizeof *o);   // передаётся → сырой (небезопасно)
+    o->w = 1;
+    расширить(o);
+    free(o);
+}
+EOF
+python3 "$ROOT/kfc.py" "$TMP/box.c" --без-проверки -o "$TMP/box.конда" 2>/dev/null
+grep -qE "^ *Ящик<Окно> o = выделить\(\)" "$TMP/box.конда" \
+    || { echo "  ОШИБКА: не-убегающий одиночный alloc → Ящик"; cat "$TMP/box.конда"; exit 1; }
+# У Ящика free снимается (autofree) — в local_case не должно остаться «free(o)».
+awk '/local_case/,/^}/' "$TMP/box.конда" | grep -q "free(o)" \
+    && { echo "  ОШИБКА: free(Ящик) должен сниматься (autofree)"; exit 1; }
+# escape_case: o убегает в вызов → остаётся сырым (ровно один Ящик во всём файле).
+[ "$(grep -c 'Ящик<Окно>' "$TMP/box.конда")" = "1" ] \
+    || { echo "  ОШИБКА: убегающий указатель не должен становиться Ящиком"; cat "$TMP/box.конда"; exit 1; }
+echo "  ок: одиночный не-убегающий alloc → Ящик (free снят); убегающий — сырой"
+
 echo "OK: все проверки прошли"
