@@ -1,4 +1,4 @@
-# konda-from-clang (kfc)
+# Konda-From-Clang (KfC) [![CI](https://github.com/daniliammo/Konda-From-Clang/actions/workflows/ci.yml/badge.svg)](https://github.com/daniliammo/Konda-From-Clang/actions/workflows/ci.yml)
 
 Конвертер **C → Konda** через AST-дамп компилятора **clang**. Отдельный проект,
 не зависит от `libkonda` и не линкует `libclang` — общение с clang только через
