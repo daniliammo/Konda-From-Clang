@@ -108,6 +108,45 @@ def раскодировать_строку(s: str) -> str:
     return "".join(out)
 
 
+def _строка_литерал_в_байты(значение: str) -> bytearray:
+    """clang-значение StringLiteral («"..."» с октальными/обычными escape) →
+    фактические БАЙТЫ (без завершающего NUL). Для «char s[N] = "..."» →
+    литерал массива символов."""
+    s = значение
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    байты = bytearray()
+    простые = {"n": 10, "t": 9, "r": 13, "0": 0, "\\": 92, '"': 34,
+               "'": 39, "a": 7, "b": 8, "f": 12, "v": 11}
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            nc = s[i + 1]
+            if nc in "01234567":                       # \NNN — октальный байт
+                j, восьм = i + 1, ""
+                while j < len(s) and len(восьм) < 3 and s[j] in "01234567":
+                    восьм += s[j]; j += 1
+                байты.append(int(восьм, 8) & 0xFF); i = j; continue
+            if nc in простые:
+                байты.append(простые[nc]); i += 2; continue
+            байты.append(ord(nc) & 0xFF); i += 2; continue
+        байты.extend(c.encode("utf-8"))
+        i += 1
+    return байты
+
+
+def _байт_в_символ(b: int) -> str:
+    """один байт → C-символьный литерал (печатный ASCII как есть, иначе escape)."""
+    спец = {0: "'\\0'", 10: "'\\n'", 9: "'\\t'", 13: "'\\r'",
+            92: "'\\\\'", 39: "'\\''"}
+    if b in спец:
+        return спец[b]
+    if 32 <= b <= 126:
+        return f"'{chr(b)}'"
+    return f"'\\{b:03o}'"                               # октальный escape
+
+
 def qualtype(n) -> str:
     t = n.get("type")
     if isinstance(t, dict):
@@ -373,6 +412,16 @@ class Конвертер:
         if isinstance(ск, dict) and ск.get("kind") == "ImplicitCastExpr" \
                 and ск.get("castKind") == "PointerToBoolean" and ск.get("inner"):
             return self._истинность(ск["inner"][0])
+        # ЯВНЫЕ скобки C сохраняем: «развернуть» их снимает, но без них теряется
+        # приоритет — «(a+b)/c» стало бы «a+b/c» = «a+(b/c)» (мискомпиляция).
+        # Konda использует C-приоритет операторов, поэтому достаточно повторить
+        # ровно ту группировку, что дал clang (ParenExpr). Снимаем только касты.
+        м = n
+        while isinstance(м, dict) and м.get("inner") and м.get("kind") in (
+                "ImplicitCastExpr", "ConstantExpr", "ExprWithCleanups", "FullExpr"):
+            м = м["inner"][-1]
+        if isinstance(м, dict) and м.get("kind") == "ParenExpr" and м.get("inner"):
+            return f"({self.выражение(м['inner'][-1])})"
         n = self.развернуть(n)
         if not n or "kind" not in n:
             return ""
@@ -381,7 +430,13 @@ class Конвертер:
         if k == "IntegerLiteral":
             return n.get("value", "0")
         if k == "FloatingLiteral":
-            return n.get("value", "0.0")
+            v = n.get("value", "0.0")
+            # clang роняет «.0» у целых float («2.0»→«2», «100.0»→«100»). Без
+            # точки Konda сочтёт литерал ЦЕЛЫМ → целочисленное деление и тип
+            # («(a+b)/2.0» дало бы int-деление). Возвращаем дробную форму.
+            if re.fullmatch(r"[+-]?\d+", v):
+                v += ".0"
+            return v
         if k == "CharacterLiteral":
             v = n.get("value", 0)
             try:
@@ -849,6 +904,18 @@ class Конвертер:
             # nullable без инициализатора в C — «пока пусто»; в Konda без
             # инициализатора нельзя, а «нуль» тут ровно то, что имел в виду C
             self.эмит(ур, f"{объ} = нуль" if нулевая else объ)
+            return
+        # char-массив со СТРОКОВЫМ инициализатором: «char s[16] = "hi"» →
+        # «символ s[16] = { 'h', 'i', '\0' }» (транспилятор требует литерал
+        # массива; хвост C зануляет). Размер, если C не указал (char s[]="hi"),
+        # берём как длина строки + NUL. char-литералы (§31) делают это выразимым.
+        if массив and kt == "символ" \
+                and self.развернуть(иниц).get("kind") == "StringLiteral":
+            байты = _строка_литерал_в_байты(self.развернуть(иниц).get("value", '""'))
+            элементы = [_байт_в_символ(b) for b in байты] + ["'\\0'"]
+            разм_л = разм if разм else str(len(байты) + 1)
+            self.эмит(ур, f"{префикс}{kt} {имя}[{разм_л}] = {{ "
+                          + ", ".join(элементы) + " }")
             return
         причина = self.причина_блокировки(иниц)
         if причина:
