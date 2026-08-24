@@ -1377,6 +1377,25 @@ class Конвертер:
             self.эмит(ур + 1, "} иначе { прервать }")
             self.эмит(ур, "}")
             return
+        # Оператор-запятая в for: «for(int i=0,j=10; …; i++,j--)». В Konda
+        # заголовок несёт ОДНУ init и ОДИН шаг. Разбиваем: доп. объявления —
+        # ДО цикла; доп. шаги — в КОНЕЦ тела. «continue» в C выполняет шаг, а
+        # перенос доп. шагов в конец тела его пропустит → пометка ПРОВЕРИТЬ.
+        перв_инит, доп_инит = self._части_инициализатора_for(init)
+        шаги = self._разбить_запятую(inc) if inc and "kind" in inc else []
+        if доп_инит or len(шаги) > 1:
+            for стр in доп_инит:
+                self.эмит(ур, стр)
+            cond_s = self._истинность(cond) if cond and "kind" in cond else ""
+            шаг_s = self.выражение(шаги[0]) if шаги else ""
+            self.эмит(ур, f"для {перв_инит}; {cond_s}; {шаг_s} {{")
+            self.тело(body, ур)
+            if len(шаги) > 1 and self._тело_имеет_continue(body):
+                self.добавить_пометку("запятая-в-for", n, ур=ур)
+            for доп_шаг in шаги[1:]:
+                self.оператор_выражение(доп_шаг, ур + 1)
+            self.эмит(ур, "}")
+            return
         init_s = self._часть(init)
         cond_s = self._истинность(cond) if cond and "kind" in cond else ""
         inc_s = self._часть(inc)
@@ -1388,6 +1407,37 @@ class Конвертер:
         self.эмит(ур, f"для {init_s}; {cond_s}; {inc_s} {{")
         self.тело(body, ур)
         self.эмит(ур, "}")
+
+    def _разбить_запятую(self, узел):
+        """Плоский список операндов дерева оператора-запятой (иначе — [узел])."""
+        раз = self.развернуть(узел) if isinstance(узел, dict) and "kind" in узел else узел
+        if isinstance(раз, dict) and раз.get("kind") == "BinaryOperator" \
+                and раз.get("opcode") == ",":
+            рез = []
+            for c in раз.get("inner", []):
+                рез.extend(self._разбить_запятую(c))
+            return рез
+        return [узел] if isinstance(узел, dict) and "kind" in узел else []
+
+    def _части_инициализатора_for(self, init):
+        """for-init → (строка_для_заголовка, [доп_строки_объявлений_до_цикла]).
+        «int i=0, j=10» (DeclStmt с >1) или «i=0, j=10» (запятая) — разбиваем."""
+        if not isinstance(init, dict) or "kind" not in init:
+            return "", []
+        if init["kind"] == "DeclStmt":
+            строки = []
+            for d in init.get("inner", []):
+                if not (isinstance(d, dict) and d.get("kind") == "VarDecl"):
+                    continue
+                kt = конда_тип(qualtype(d))
+                имя = d.get("name", "_")
+                вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c]
+                строки.append(f"{kt} {имя} = {self.выражение(вн[-1])}" if вн
+                              else f"{kt} {имя}")
+            return (строки[0] if строки else ""), строки[1:]
+        части = self._разбить_запятую(init)
+        строки = [self.выражение(c) for c in части]
+        return (строки[0] if строки else ""), строки[1:]
 
     def _часть(self, x):
         """for-init/step одной строкой (без переноса)."""
