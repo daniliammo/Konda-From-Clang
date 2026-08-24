@@ -147,6 +147,27 @@ def _байт_в_символ(b: int) -> str:
     return f"'\\{b:03o}'"                               # октальный escape
 
 
+_ШИРИНА_ЦЕЛОГО = {
+    "char": 8, "signed char": 8, "unsigned char": 8, "_Bool": 8, "bool": 8,
+    "short": 16, "short int": 16, "unsigned short": 16, "unsigned short int": 16,
+    "int": 32, "unsigned int": 32, "unsigned": 32, "wchar_t": 32,
+    "long": 64, "long int": 64, "unsigned long": 64, "unsigned long int": 64,
+    "long long": 64, "long long int": 64, "unsigned long long": 64,
+    "unsigned long long int": 64, "size_t": 64, "ssize_t": 64, "ptrdiff_t": 64,
+    "intptr_t": 64, "uintptr_t": 64, "off_t": 64, "time_t": 64,
+    "int8_t": 8, "uint8_t": 8, "int16_t": 16, "uint16_t": 16,
+    "int32_t": 32, "uint32_t": 32, "int64_t": 64, "uint64_t": 64,
+}
+
+
+def _ширина_целого(qt: str):
+    """Ширина ЦЕЛОГО C-типа в битах (указатель = 64), иначе None (не целое)."""
+    t = без_квалификаторов(qt).strip()
+    if "*" in t or "[" in t:
+        return 64                                  # указатель/массив-указатель
+    return _ШИРИНА_ЦЕЛОГО.get(t)
+
+
 def qualtype(n) -> str:
     t = n.get("type")
     if isinstance(t, dict):
@@ -402,6 +423,13 @@ class Конвертер:
         return self.выражение(узел)
 
     # ── выражения ───────────────────────────────────────────────────────────────
+    def _каст_сужает(self, ист_qt, цель_qt) -> bool:
+        """Целочисленный каст ист→цель СУЖАЕТ (цель уже источника)? Только тогда
+        нужен явный «как<>()» — расширение/равенство транспилятор принимает сам."""
+        wи = _ширина_целого(ист_qt)
+        wц = _ширина_целого(цель_qt)
+        return wи is not None and wц is not None and wц < wи
+
     def выражение(self, n) -> str:
         # NULL и истинность указателя распознаются ДО «развернуть»: тот снимает
         # ImplicitCastExpr, а именно в нём (NullToPointer/PointerToBoolean)
@@ -412,6 +440,17 @@ class Конвертер:
         if isinstance(ск, dict) and ск.get("kind") == "ImplicitCastExpr" \
                 and ск.get("castKind") == "PointerToBoolean" and ск.get("inner"):
             return self._истинность(ск["inner"][0])
+        # СУЖАЮЩИЙ неявный каст (size_t→int «int n=strlen(s)», double→int) —
+        # «развернуть» его снимает, теряя намерение → транспилятор требует
+        # «как<>()» (запрет неявного сужения). Повторяем каст явно (тот же класс
+        # потери информации, что и со скобками). Расширяющие касты не трогаем.
+        if isinstance(n, dict) and n.get("kind") == "ImplicitCastExpr" \
+                and n.get("inner"):
+            ck = n.get("castKind")
+            if ck == "FloatingToIntegral" or (ck == "IntegralCast"
+                    and self._каст_сужает(qualtype(n["inner"][0]), qualtype(n))):
+                kt = конда_тип(без_квалификаторов(qualtype(n)))
+                return f"как<{kt}>({self.выражение(n['inner'][0])})"
         # ЯВНЫЕ скобки C сохраняем: «развернуть» их снимает, но без них теряется
         # приоритет — «(a+b)/c» стало бы «a+b/c» = «a+(b/c)» (мискомпиляция).
         # Konda использует C-приоритет операторов, поэтому достаточно повторить
