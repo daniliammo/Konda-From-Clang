@@ -602,7 +602,7 @@ class Конвертер:
     def _инициализатор(self, n) -> str:
         """InitListExpr → «{ поле = знач }» для структуры, «{ a, b }» для массива."""
         т = без_квалификаторов(qualtype(n))
-        вн = [c for c in n.get("inner", []) if isinstance(c, dict) and "kind" in c]
+        вн = [c for c in n.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
         имя_структуры = None
         if т.startswith("struct "):
             имя_структуры = т[len("struct "):].strip()
@@ -916,7 +916,7 @@ class Конвертер:
             имя_т = getattr(self, "фнптр_типы", {}).get(
                 (разб_фнптр[0], tuple(разб_фнптр[1])))
             дети = [c for c in d.get("inner", [])
-                    if isinstance(c, dict) and "kind" in c]
+                    if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
             if имя_т:
                 if дети:
                     self.эмит(ур, f"{имя_т} {имя} = {self.выражение(дети[-1])}")
@@ -929,7 +929,7 @@ class Конвертер:
                               else f"// {имя}")
             return
         kt = конда_тип(qt)
-        вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c]
+        вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
         иниц = вн[-1] if вн else None
         массив = "[" in без_квалификаторов(qt)
         разм = ""
@@ -1030,7 +1030,7 @@ class Конвертер:
         индексу (порядок self.поля_структур), именованные — по имени."""
         поля = self.поля_структур.get(имя_стр, [])
         типы_полей = self.типы_полей.get(имя_стр, [])
-        вн = [c for c in иниц.get("inner", []) if isinstance(c, dict) and "kind" in c]
+        вн = [c for c in иниц.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
         for i, значение in enumerate(вн):
             if i >= len(поля):
                 break
@@ -1508,7 +1508,7 @@ class Конвертер:
                     continue
                 kt = конда_тип(qualtype(d))
                 имя = d.get("name", "_")
-                вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c]
+                вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
                 строки.append(f"{kt} {имя} = {self.выражение(вн[-1])}" if вн
                               else f"{kt} {имя}")
             return (строки[0] if строки else ""), строки[1:]
@@ -1524,7 +1524,7 @@ class Конвертер:
             d = x.get("inner", [{}])[0]
             kt = конда_тип(qualtype(d))
             имя = d.get("name", "_")
-            вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c]
+            вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
             if вн:
                 return f"{kt} {имя} = {self.выражение(вн[-1])}"
             return f"{kt} {имя}"
@@ -1804,7 +1804,7 @@ class Конвертер:
             if без_квалификаторов(qt).count("*") != 1:
                 return None
             # инициализатор = первый параметр (data)
-            вн = [c for c in vd.get("inner", []) if isinstance(c, dict) and "kind" in c]
+            вн = [c for c in vd.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
             если_data = вн and self.базовое_имя(вн[-1]) == первый
             if not если_data:
                 return None
@@ -1854,7 +1854,7 @@ class Конвертер:
             имена_полей = [p.get("name") for p in все_типы[S].get("inner", [])
                            if p.get("kind") == "FieldDecl" and p.get("name")]
             # инициализатор G — список функций (позиционно/designated)
-            вн = [c for c in gd.get("inner", []) if isinstance(c, dict) and "kind" in c]
+            вн = [c for c in gd.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
             init = self.развернуть(вн[-1]) if вн else {}
             if init.get("kind") != "InitListExpr":
                 return
@@ -1948,7 +1948,7 @@ class Конвертер:
             # Изменяемый целочисленный глобал → атом<T>. Инициализатор — как есть
             # (обычно константа); объявление сформируем сами (объявление() не
             # знает про «атом<…>» как тип).
-            вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c]
+            вн = [c for c in d.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
             иниц = вн[-1] if вн else None
             зн = self.выражение(иниц) if иниц is not None else "0"
             self.эмит(ур, f"атом<{kt}> {имя} = {зн}")
@@ -2045,7 +2045,7 @@ class Конвертер:
             if n.get("id") in getattr(self, "сл_подавить", ()):
                 return False
             qt = без_квалификаторов(qualtype(n))
-            вн = [c for c in n.get("inner", []) if isinstance(c, dict) and "kind" in c]
+            вн = [c for c in n.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
             иниц = вн[-1] if вн else None
             # исключаем malloc (→ срез), одиночную аллокацию (→ Ящик) и адрес-оф
             if "*" in qt and иниц is not None and self.небезопасен(иниц) \
