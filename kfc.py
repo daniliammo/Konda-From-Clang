@@ -75,9 +75,47 @@ class Политика:
     "uint8_t": "байт", "uint16_t": "целое16", "uint32_t": "целое32", "uint64_t": "целое64",
     "size_t": "целое64", "ssize_t": "целое64", "ptrdiff_t": "целое64",
     "intptr_t": "целое64", "uintptr_t": "целое64", "wchar_t": "целое32",
+    # POSIX/glibc typedefs (Итер. 2). У glibc есть внутренние «__X_t»-псевдонимы
+    # (напр. «__time_t» вместо публичного «time_t»); маппим оба варианта.
+    "time_t": "целое64", "__time_t": "целое64",
+    "suseconds_t": "целое64", "__suseconds_t": "целое64",
+    "clock_t": "целое64", "__clock_t": "целое64",
+    "off_t": "целое64", "__off_t": "целое64", "off64_t": "целое64",
+    "pid_t": "целое32", "__pid_t": "целое32",
+    "uid_t": "целое32", "__uid_t": "целое32",
+    "gid_t": "целое32", "__gid_t": "целое32",
+    "mode_t": "целое32", "__mode_t": "целое32",
+    "dev_t": "целое64", "__dev_t": "целое64",
+    "ino_t": "целое64", "__ino_t": "целое64", "ino64_t": "целое64",
+    "nlink_t": "целое64", "__nlink_t": "целое64",
+    "blkcnt_t": "целое64", "__blkcnt_t": "целое64",
+    "blksize_t": "целое64", "__blksize_t": "целое64",
+    "fsblkcnt_t": "целое64", "fsfilcnt_t": "целое64",
+    "id_t": "целое32", "__id_t": "целое32",
+    "key_t": "целое32", "__key_t": "целое32",
+    "useconds_t": "целое32", "__useconds_t": "целое32",
+    "socklen_t": "целое32", "__socklen_t": "целое32",
+    "in_addr_t": "целое32", "in_port_t": "целое16",
+    "sa_family_t": "целое16", "__sa_family_t": "целое16",
+    "__uint8_t": "целое8", "__uint16_t": "целое16",
+    "__uint32_t": "целое32", "__uint64_t": "целое64",
+    "__int8_t": "целое8", "__int16_t": "целое16",
+    "__int32_t": "целое32", "__int64_t": "целое64",
+    "__u_char": "целое8", "__u_short": "целое16",
+    "__u_int": "целое32", "__u_long": "целое64",
 }
 ВСЕГДА_БЕЗЗНАК = {"unsigned char", "uint8_t", "uint16_t", "uint32_t",
-                  "uint64_t", "size_t", "uintptr_t"}
+                  "uint64_t", "size_t", "uintptr_t",
+                  # POSIX/glibc unsigned
+                  "mode_t", "__mode_t", "uid_t", "__uid_t", "gid_t", "__gid_t",
+                  "dev_t", "__dev_t", "ino_t", "__ino_t", "ino64_t",
+                  "nlink_t", "__nlink_t", "blkcnt_t", "__blkcnt_t",
+                  "blksize_t", "__blksize_t", "fsblkcnt_t", "fsfilcnt_t",
+                  "socklen_t", "__socklen_t", "in_addr_t", "in_port_t",
+                  "sa_family_t", "__sa_family_t", "id_t", "__id_t",
+                  "useconds_t", "__useconds_t", "key_t", "__key_t",
+                  "__u_char", "__u_short", "__u_int", "__u_long",
+                  "__uint8_t", "__uint16_t", "__uint32_t", "__uint64_t"}
 
 
 def раскодировать_строку(s: str) -> str:
