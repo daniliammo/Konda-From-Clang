@@ -3559,6 +3559,66 @@ def конвертировать(путь, доп, транспилятор=None
     return е.текст, е.к, диаги, итераций
 
 
+def _найти_compile_commands(файл_c):
+    """Ищет compile_commands.json в предках заданного файла (в т.ч. в build/
+    рядом), возвращает путь или None. Позволяет автоподхват флагов без «--»."""
+    кат = os.path.dirname(os.path.abspath(файл_c))
+    while кат:
+        # Прямо в текущем каталоге
+        п = os.path.join(кат, "compile_commands.json")
+        if os.path.isfile(п):
+            return п
+        # Типичный build/ рядом (проекты meson/cmake)
+        для_build = os.path.join(кат, "build", "compile_commands.json")
+        if os.path.isfile(для_build):
+            return для_build
+        родитель = os.path.dirname(кат)
+        if родитель == кат:
+            break
+        кат = родитель
+    return None
+
+
+def _флаги_из_compile_commands(cc_путь, файл_c):
+    """Достаёт флаги для КОНКРЕТНОГО файла из compile_commands.json (или None,
+    если нет записи для файла). Формат тот же, что у _из_compile_commands."""
+    try:
+        with open(cc_путь, encoding="utf-8") as fh:
+            записи = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    абс_c = os.path.abspath(файл_c)
+    for з in записи:
+        ф = з.get("file", "")
+        если_ф_абс = ф if os.path.isabs(ф) else \
+            os.path.normpath(os.path.join(з.get("directory", "."), ф))
+        if os.path.abspath(если_ф_абс) != абс_c:
+            continue
+        кат = з.get("directory", ".")
+        арги = з.get("arguments") or (з.get("command") or "").split()
+        флаги = []
+        i = 0
+        while i < len(арги):
+            а = арги[i]
+            if а in ("-I", "-D", "-U", "-include") and i + 1 < len(арги):
+                зн = арги[i + 1]
+                if а == "-I" and not os.path.isabs(зн):
+                    зн = os.path.normpath(os.path.join(кат, зн))
+                флаги += [а, зн]
+                i += 2
+                continue
+            if а.startswith("-I") and len(а) > 2:
+                тело = а[2:]
+                if not os.path.isabs(тело):
+                    тело = os.path.normpath(os.path.join(кат, тело))
+                флаги.append("-I" + тело)
+            elif а.startswith(("-D", "-U", "-std=")):
+                флаги.append(а)
+            i += 1
+        return флаги
+    return None
+
+
 def _из_compile_commands(путь, доп):
     """compile_commands.json → [(файл.c, флаги clang)]. Берём только флаги,
     влияющие на препроцессор/стандарт: -I/-D/-U/-std/-include; относительные
@@ -3640,7 +3700,21 @@ def main(argv):
                 доп_по_файлам[ф] = флаги
         else:
             развернутые.append(п)
-            доп_по_файлам[п] = доп
+            # Итер. 3: если пользователь НЕ передал «--»-флаги, попробовать
+            # автоподхватить их из compile_commands.json (в build/ или в
+            # предках). Ускоряет запуск на средних/больших проектах (weston):
+            # достаточно указать сам .c без ручных -I/-D. Явные «--»-флаги
+            # (доп непустое) имеют приоритет — не перебиваем.
+            если_доп = list(доп)
+            if not если_доп:
+                cc = _найти_compile_commands(п)
+                if cc:
+                    авт = _флаги_из_compile_commands(cc, п)
+                    if авт:
+                        если_доп = авт
+                        sys.stderr.write(
+                            f"kfc: автоподхват флагов из {cc} ({len(авт)} флагов)\n")
+            доп_по_файлам[п] = если_доп
     пути = развернутые
     if not пути:
         sys.stderr.write("не указано ни одного файла .c\n")
