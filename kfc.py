@@ -1784,13 +1784,39 @@ class Конвертер:
 
     def _каст_из_колбэка(self, func):
         """Первый оператор тела колбэка — «struct T *cv = data»? → (cv, T_c, каст_id).
-        data — имя первого параметра (void*). Иначе None."""
+        data — имя первого параметра (void*). Иначе None.
+
+        Совместимая обёртка над _детект_каст_data (позиция всегда 0)."""
+        r = self._детект_каст_data(func, только_первый=True)
+        if r is None:
+            return None
+        _idx, param_name, cv, tc, cast_id = r
+        return (cv, tc, cast_id, param_name)
+
+    def _детект_каст_data(self, func, только_первый=False):
+        """Ищет параметр «void *X» И первый оператор тела вида «T *cv = X;».
+        → (индекс_параметра, имя_параметра, cv, T_c_имя, каст_id) или None.
+
+        Если только_первый=True — принимаем ТОЛЬКО когда void*-параметр первый
+        (для идиомы wl_listener/add_listener, где data всегда 0-й). Иначе
+        сканируем ВСЕ параметры (weston-widget: void*data обычно последний)."""
         парамы = [p for p in func.get("inner", []) if p.get("kind") == "ParmVarDecl"]
         if not парамы:
             return None
-        первый = парамы[0].get("name")
-        if без_квалификаторов(qualtype(парамы[0])).strip() != "void *":
+        # Найти void*-параметр
+        void_idx = -1
+        for i, p in enumerate(парамы):
+            qt = без_квалификаторов(qualtype(p)).strip()
+            if qt == "void *" and p.get("name"):
+                void_idx = i
+                if только_первый and i != 0:
+                    return None
+                break
+        if void_idx < 0:
             return None
+        if только_первый and void_idx != 0:
+            return None
+        имя_параметра = парамы[void_idx].get("name")
         тело = next((c for c in func.get("inner", []) if c.get("kind") == "CompoundStmt"), None)
         if not тело:
             return None
@@ -1803,13 +1829,16 @@ class Конвертер:
             qt = qualtype(vd)
             if без_квалификаторов(qt).count("*") != 1:
                 return None
-            # инициализатор = первый параметр (data)
+            # инициализатор = наш void*-параметр по имени
             вн = [c for c in vd.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
-            если_data = вн and self.базовое_имя(вн[-1]) == первый
+            если_data = вн and self.базовое_имя(вн[-1]) == имя_параметра
             if not если_data:
                 return None
-            return (vd.get("name"), без_квалификаторов(qt).replace("*", "").strip(),
-                    vd.get("id"), первый)
+            T_c = без_квалификаторов(qt).replace("*", "").strip()
+            # v1: только пользовательский тип (struct/typedef), не void/char/примитив
+            if not T_c or T_c in ("void", "char"):
+                return None
+            return (void_idx, имя_параметра, vd.get("name"), T_c, vd.get("id"))
         return None
 
     def _анализ_слушателей(self, декларации, все_типы):
@@ -1890,8 +1919,9 @@ class Конвертер:
                                "поля": [(поле, функции[фн]) for поле, фн in привязки]}
             self.сл_экземпляры[G] = {"S": S, "поля": привязки}
             for фн, (cv, tc, кид, _v) in колбэки_данные.items():
+                # wl_listener-идиома: void*data всегда первый параметр (индекс 0).
                 self.сл_колбэки[фн] = {"T_konda": конда_тип(tc), "каст_var": cv,
-                                       "каст_id": кид}
+                                       "каст_id": кид, "параметр_индекс": 0}
             self.сл_рег[call.get("id")] = (self.базовое_имя(_f), а_obj, G, а_data)
 
         def скан(n):
@@ -1904,6 +1934,25 @@ class Конвертер:
         for d in декларации:
             if d.get("kind") == "FunctionDecl":
                 скан(d)
+
+        # Второй проход: автоопределение колбэков ЛЮБОГО registrar-паттерна.
+        # Weston-widget: «widget_set_XX_handler(w, cb)» + колбэк «(widget*, …,
+        # void *data)» с «T *x = data;» первой строкой. add_listener-паттерн
+        # (data — первый параметр) уже поймал первый проход; здесь ЛЮБАЯ
+        # позиция void*data. Не переопределяем уже зарегистрированные колбэки.
+        for d in декларации:
+            if d.get("kind") != "FunctionDecl":
+                continue
+            имя_ф = d.get("name")
+            if not имя_ф or имя_ф in self.сл_колбэки:
+                continue
+            det = self._детект_каст_data(d, только_первый=False)
+            if det is None:
+                continue
+            void_idx, _param_name, cv, T_c, кид = det
+            self.сл_колбэки[имя_ф] = {"T_konda": конда_тип(T_c),
+                                       "каст_var": cv, "каст_id": кид,
+                                       "параметр_индекс": void_idx}
 
     def эмит_слушатель_типы(self):
         """Печатает «внешний слушатель<T> S_сл для S { поле(изменяемый T, …) … }»
@@ -2287,8 +2336,9 @@ class Конвертер:
             if имя == "точка_входа":
                 continue           # §36: параметры точки входа — фиксированный срез
             индекс_п += 1
-            # Колбэк слушателя: первый параметр «void*data» → «изменяемый T cv».
-            if self.тек_колбэк and индекс_п == 0:
+            # Колбэк слушателя / weston-widget: параметр по СОХРАНЁННОМУ ИНДЕКСУ
+            # (add_listener всегда 0, widget-handler обычно последний).
+            if self.тек_колбэк and индекс_п == self.тек_колбэк.get("параметр_индекс", 0):
                 T = self.тек_колбэк["T_konda"]
                 cv = self.тек_колбэк["каст_var"]
                 параметры.append(f"изменяемый {T} {cv}")
