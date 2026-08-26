@@ -1880,20 +1880,30 @@ class Конвертер:
         тело = next((c for c in func.get("inner", []) if c.get("kind") == "CompoundStmt"), None)
         if not тело:
             return None
+        # Ищем «T *cv = data» среди РАННИХ объявлений тела. Объявления, не
+        # относящиеся к data (напр. «static const double r = 10.0» первой
+        # строкой в weston-колбэках), ПРОПУСКАЕМ, а не отвергаем идиому.
         for ст in тело.get("inner", []):
             if ст.get("kind") != "DeclStmt":
+                # Не-декларация: если она читает data напрямую (сырое
+                # использование void* до каста) — это не наша идиома.
+                if self._читает_имя(имя_параметра, ст):
+                    return None
                 continue
             vd = next((c for c in ст.get("inner", []) if c.get("kind") == "VarDecl"), None)
             if not vd:
                 continue
-            qt = qualtype(vd)
-            if без_квалификаторов(qt).count("*") != 1:
-                return None
-            # инициализатор = наш void*-параметр по имени
             вн = [c for c in vd.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
             если_data = вн and self.базовое_имя(вн[-1]) == имя_параметра
             if not если_data:
-                return None
+                # Объявление не про data: пропускаем, но если оно всё же
+                # упоминает data иначе — не идиома (сырое использование).
+                if self._читает_имя(имя_параметра, ст):
+                    return None
+                continue
+            qt = qualtype(vd)
+            if без_квалификаторов(qt).count("*") != 1:
+                return None    # data кастуется, но не в «T*» — не наша идиома
             T_c = без_квалификаторов(qt).replace("*", "").strip()
             # v1: только пользовательский тип (struct/typedef), не void/char/примитив
             if not T_c or T_c in ("void", "char"):
