@@ -1041,6 +1041,14 @@ class Конвертер:
         if иниц.get("kind") == "ConditionalOperator":
             self._тернарник_в_если(объ, имя, иниц, ур)
             return
+        # void*→T* реинтерпрет геттера (window_get_user_data и т.п.): узкий
+        # «T* x = небезопасно(как<T*>(источник))» (§57) — приёмник безопасен,
+        # функция НЕ уходит в «небезопасно» целиком. Источник берём через
+        # выражение(иниц) (каст снят развернуть'ом → голый вызов).
+        реинт_kt = self._void_реинтерпрет_иниц(d)
+        if реинт_kt is not None:
+            self.эмит(ур, f"{объ} = небезопасно(как<{реинт_kt}>({self.выражение(иниц)}))")
+            return
         if self.небезопасен(иниц):
             умолч = значение_по_умолчанию(kt if not массив else "нет")
             if массив or умолч is None:
@@ -2152,6 +2160,38 @@ class Конвертер:
                 рез.add(имя)                    # не-const, но доказанно неизменяем
         return рез
 
+    def _void_реинтерпрет_иниц(self, vd):
+        """VarDecl «T *x = <void*→T* reinterpret>» (геттер user-data:
+        window_get_user_data и т.п.)? → Konda-тип «T*» (именованная структура)
+        или None. Такой реинтерпрет теперь эмитим узко: «T* x =
+        небезопасно(как<T*>(источник))» — приёмник остаётся БЕЗОПАСНЫМ (§57),
+        всю функцию в «небезопасно» заворачивать не нужно."""
+        qt = без_квалификаторов(qualtype(vd))
+        if qt.count("*") != 1 or "[" in qt:
+            return None
+        баз = qt.replace("*", "").strip().replace("struct ", "").strip()
+        # Только именованная структура проекта — иначе тип элемента неизвестен
+        # (нельзя обещать безопасный member-доступ).
+        if баз in ("void", "char") or баз not in self.поля_структур:
+            return None
+        вн = [c for c in vd.get("inner", [])
+              if isinstance(c, dict) and "kind" in c
+              and not c.get("kind", "").endswith("Comment")]
+        иниц = вн[-1] if вн else None
+        # Верхний каст (через возможные обёртки) — BitCast с source «void *».
+        c = иниц
+        while isinstance(c, dict) and c.get("kind") in (
+                "ImplicitCastExpr", "CStyleCastExpr", "ParenExpr",
+                "ConstantExpr", "FullExpr", "ExprWithCleanups"):
+            if c.get("kind") in ("ImplicitCastExpr", "CStyleCastExpr") \
+                    and c.get("castKind") == "BitCast":
+                вну = (c.get("inner") or [{}])[0]
+                if isinstance(вну, dict) \
+                        and без_квалификаторов(qualtype(вну)).strip() == "void *":
+                    return конда_тип(qt)
+            c = (c.get("inner") or [{}])[0]
+        return None
+
     def _указатель_декл_небезоп(self, n) -> bool:
         """Есть ли объявление указателя с небезопасным инициализатором —
         такое нельзя statement-обернуть (переменная уйдёт из области), значит
@@ -2167,6 +2207,10 @@ class Конвертер:
             вн = [c for c in n.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
             иниц = вн[-1] if вн else None
             # исключаем malloc (→ срез), одиночную аллокацию (→ Ящик) и адрес-оф
+            # void*→T* реинтерпрет геттера — теперь узкий «небезопасно(как<T*>(…))»
+            # (§57): переменная-приёмник безопасна, всю функцию не оборачиваем.
+            if self._void_реинтерпрет_иниц(n) is not None:
+                return False
             if "*" in qt and иниц is not None and self.небезопасен(иниц) \
                     and self._malloc_в_срез(n.get("name", ""), qualtype(n), иниц) is None \
                     and self._alloc_в_ящик(n.get("name", ""), qualtype(n), иниц) is None \
