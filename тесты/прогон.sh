@@ -41,16 +41,19 @@ check() {
     name="$1"; want="$2"
     python3 "$ROOT/kfc.py" "$ROOT/примеры/$name.c" -o "$TMP/$name.конда" 2>/dev/null
     echo "  $name: .конда сгенерирован"
-    [ -x "$TRBIN" ] || { echo "    (пропуск транспиляции: нет $TRBIN)"; return 0; }
     cp "$TMP/$name.конда" "$TR/_smoke_$name.конда"
-    if ( cd "$TR" && ./Собранное/ТранспиляторКонда "_smoke_$name.конда" >/dev/null 2>&1 ); then
+    # stderr транспилятора (и его внутреннего cc) сохраняем — при провале печатаем,
+    # иначе на CI видно лишь «не прошло транспилятор» без причины.
+    if ( cd "$TR" && ./Собранное/ТранспиляторКонда "_smoke_$name.конда" >/dev/null 2>"$TMP/$name.trlog" ); then
         out="$("$TR/вывод/_smoke_$name.elf" 2>&1 || true)"
         rm -f "$TR/_smoke_$name.конда"
         echo "$out" | grep -q "$want" || { echo "    ОШИБКА вывода: нет «$want»"; echo "$out"; exit 1; }
         echo "    транспилировано и запущено, вывод содержит «$want»"
     else
-        rm -f "$TR/_smoke_$name.конда"
-        echo "    ОШИБКА: не прошло транспилятор"; exit 1
+        echo "    ОШИБКА: не прошло транспилятор"
+        echo "    --- вывод транспилятора: ---"; sed 's/^/    /' "$TMP/$name.trlog"
+        echo "    --- сгенерированный .конда: ---"; sed 's/^/    /' "$TR/_smoke_$name.конда"
+        rm -f "$TR/_smoke_$name.конда"; exit 1
     fi
 }
 
