@@ -58,11 +58,31 @@ jobs:
           fi
           clang --version | head -1
 
+      - name: Установить зависимости транспилятора (jemalloc)
+        run: sudo apt-get install -y libjemalloc-dev
+
+      - name: Склонировать транспилятор Konda
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/daniliammo/Konda "$RUNNER_TEMP/ТранспиляторКонда"
+          echo "KONDA_TRANSPILER=$RUNNER_TEMP/ТранспиляторКонда" >> "$GITHUB_ENV"
+          # Транспилятор требует полный C23 (gcc >= 15 / clang >= 19). Штатный
+          # gcc раннера слишком стар → собираем его через clang. CC=clang в среде
+          # подхватит и «make» внутри прогон.sh (Makefile: «CC ?= cc»).
+          echo "CC=clang" >> "$GITHUB_ENV"
+          # Сгенерированный .elf транспилятор компилирует буквальным «cc» (не CC),
+          # поэтому системный cc тоже переводим на clang — иначе старый gcc
+          # раннера не осилит эмитируемый C23.
+          sudo update-alternatives --install /usr/bin/cc cc "$(command -v clang)" 100
+
+      - name: Собрать транспилятор Konda (clang, C23)
+        run: make -C "$KONDA_TRANSPILER"
+
       - name: Проверить инструменты
         run: |
           clang --version | head -1
           python3 --version
           clang -Xclang -ast-dump=json -fsyntax-only примеры/demo.c >/dev/null && echo "ast-dump JSON OK"
 
-      - name: Прогнать тесты
+      - name: Прогнать тесты (kfc.py → транспилятор → .elf)
         run: sh тесты/прогон.sh
