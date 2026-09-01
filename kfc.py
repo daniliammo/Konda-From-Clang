@@ -273,6 +273,16 @@ def конда_тип(qt: str) -> str:
     if t.startswith("void") and указатели > 0:
         return "символ" + "*" * указатели      # void* → символ* (приближение)
     имя = БАЗА_ТИПОВ.get(ключ)
+    if имя is None and ключ.startswith("__"):
+        # clang спеллит size_t/ssize_t/intptr_t/… ВНУТРЕННИМ псевдонимом glibc
+        # («__size_t» вместо публичного «size_t») — и НАБОР зависит от версии
+        # (clang-23 даёт «__size_t», clang-21 — «unsigned long»). Публичное имя
+        # (без ведущего «__») лежит в таблице → пробуем его, вместо того чтобы
+        # тащить сырой «__size_t» в вывод (невалидный Konda-тип).
+        альт = ключ[2:]
+        имя = БАЗА_ТИПОВ.get(альт)
+        if имя is not None and альт in ВСЕГДА_БЕЗЗНАК:
+            беззнак = True
     if имя is None:
         имя = (ключ.replace("struct ", "").replace("enum ", "")
                .replace("union ", "").strip()) or "целое32"
