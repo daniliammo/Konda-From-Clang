@@ -53,6 +53,29 @@ check() {
         echo "    ОШИБКА: не прошло транспилятор"
         echo "    --- вывод транспилятора: ---"; sed 's/^/    /' "$TMP/$name.trlog"
         echo "    --- сгенерированный .конда: ---"; sed 's/^/    /' "$TR/_smoke_$name.конда"
+        # Диагностика: типы узлов инициализаторов из clang JSON AST (спеллинг
+        # size_t/long зависит от версии clang → нужно видеть точный qualType).
+        if command -v clang >/dev/null 2>&1; then
+            echo "    --- типы инициализаторов (clang AST) для $name.c: ---"
+            clang -Xclang -ast-dump=json -fsyntax-only "$ROOT/примеры/$name.c" 2>/dev/null \
+              | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception as e: print("    (AST не разобран:",e,")"); sys.exit(0)
+def qt(x):
+    t=x.get("type")
+    return t.get("qualType","") if isinstance(t,dict) else (t or "")
+def show(x,ind):
+    if not isinstance(x,dict): return
+    print("    "+" "*ind+x.get("kind","?")+" "+repr(qt(x))+" "+x.get("castKind",""))
+    for c in x.get("inner",[]): show(c,ind+2)
+def walk(n):
+    if not isinstance(n,dict): return
+    if n.get("kind")=="VarDecl":
+        print("    VarDecl",n.get("name")); show(n,2)
+    for c in n.get("inner",[]): walk(c)
+walk(d)' 2>/dev/null || echo "    (диагностика AST не удалась)"
+        fi
         rm -f "$TR/_smoke_$name.конда"; exit 1
     fi
 }

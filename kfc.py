@@ -203,7 +203,32 @@ def _ширина_целого(qt: str):
     t = без_квалификаторов(qt).strip()
     if "*" in t or "[" in t:
         return 64                                  # указатель/массив-указатель
-    return _ШИРИНА_ЦЕЛОГО.get(t)
+    ш = _ШИРИНА_ЦЕЛОГО.get(t)
+    if ш is not None:
+        return ш
+    # Толерантный фолбэк по СЛОВАМ: clang/gcc и их версии спеллят один тип
+    # по-разному («unsigned long» ↔ «long unsigned int», size_t как typedef или
+    # десугар). Точная таблица это не покрывает → определяем ширину по ключевым
+    # словам. Плавающие СНАЧАЛА отсекаем (у «long double» есть «long», но это не
+    # целое → None, иначе ложно навесили бы «как<>»).
+    if "double" in t or "float" in t:
+        return None
+    if "(" in t or ")" in t or "{" in t:           # функц-тип/составное — не целое
+        return None
+    слова = set(t.split())
+    if "long" in слова:                            # long / unsigned long / long int…
+        return 64
+    if "short" in слова:
+        return 16
+    if слова & {"char", "bool", "_Bool"}:
+        return 8
+    if слова & {"int", "unsigned", "signed"}:
+        return 32
+    # size_t-подобные typedef'ы, не попавшие в таблицу (все 64-бит на LP64)
+    if t.endswith("_t") and ("size" in t or "ptr" in t or "off" in t
+                             or "int" in t or "long" in t):
+        return 64
+    return None
 
 
 def qualtype(n) -> str:
