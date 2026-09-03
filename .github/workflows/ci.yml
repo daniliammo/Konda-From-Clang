@@ -16,10 +16,13 @@ jobs:
       - name: Проверить репозиторий
         uses: actions/checkout@v4
 
-      - name: Установить Python
+      - name: Установить Python (последний стабильный, без кэша старого патча)
         uses: actions/setup-python@v5
         with:
+          # «3.x» — новейший стабильный Python 3; check-latest берёт САМЫЙ свежий
+          # патч, а не закэшированный раннером (политика «только последнее»).
           python-version: '3.x'
+          check-latest: true
 
       - name: Установить последнюю версию clang (apt.llvm.org)
         run: |
@@ -47,12 +50,11 @@ jobs:
             fi
           fi
 
-          # Запасной путь: свежая ветка из того же репозитория, затем системный clang.
-          echo "deb [signed-by=/etc/apt/trusted.gpg.d/llvm-snapshot.asc] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-21 main" \
-            | sudo tee -a /etc/apt/sources.list.d/llvm-apt.list >/dev/null || true
-          sudo apt-get update -q || true
-          if sudo apt-get install -y clang-21; then
-            sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
+          # Запасной путь — БЕЗ легаси-пинов (политика «только последнее»): если
+          # метапакет не встал, ставим НАЙДЕННЫЙ новейший «clang-<MAJOR>» явно,
+          # иначе — системный clang. Никаких захардкоженных старых мажоров.
+          if [ -n "$MAJOR" ] && sudo apt-get install -y "$MAJOR"; then
+            sudo update-alternatives --install /usr/bin/clang clang "/usr/bin/$MAJOR" 100
           else
             sudo apt-get install -y clang
           fi
