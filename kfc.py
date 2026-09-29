@@ -884,6 +884,14 @@ class Конвертер:
             callee = self.выражение(вн[0]) if вн else "?"
             арги = ", ".join(self.выражение(a) for a in вн[1:])
             return f"{callee}({арги})"
+        if k == "CStyleCastExpr":
+            # C container_of («wl_container_of» и т.п.): «(T*)((char*)p -
+            # offsetof(T, поле))» → встроенная «контейнер_из<T>(p, поле)» (§121).
+            контейнер = self._контейнер(n)
+            if контейнер is not None:
+                тип_т, указатель, поле = контейнер
+                return (f"контейнер_из<{конда_тип(тип_т)}>"
+                        f"({self.выражение(self._снять_обёртки(указатель))}, {поле})")
         if k in ("CStyleCastExpr", "CXXStaticCastExpr"):
             цель = конда_тип(qualtype(n))
             внутр = self.выражение(вн[0]) if вн else ""
@@ -931,6 +939,210 @@ class Конвертер:
         if k in ("CompoundLiteralExpr",):
             return self.выражение(вн[-1]) if вн else "{ }"
         return f"/*?{k}*/"
+
+    @staticmethod
+    def _снять_обёртки(n):
+        """Снимает скобки/неявные касты (НЕ явные)."""
+        while isinstance(n, dict) and n.get("kind") in (
+                "ParenExpr", "ImplicitCastExpr", "ConstantExpr") and n.get("inner"):
+            n = n["inner"][0]
+        return n
+
+    @staticmethod
+    def _развёрнутый_тип(n) -> str:
+        т = n.get("type") or {}
+        return без_квалификаторов(т.get("desugaredQualType") or т.get("qualType", ""))
+
+    def _контейнер(self, n):
+        """C container_of: «(T*)((char*)(p) - offsetof(T, поле))» → (C-тип T,
+        узел p, имя поля) или None. clang JSON не хранит поле у OffsetOfExpr —
+        берём ЕДИНСТВЕННОЕ поле T того же типа, что и объект под p (звено
+        «struct wl_list»); неоднозначно — None (остаётся прежний перевод)."""
+        if not isinstance(n, dict) or n.get("kind") != "CStyleCastExpr" \
+                or not n.get("inner"):
+            return None
+        цель_т = self._развёрнутый_тип(n)
+        if not цель_т.endswith("*"):
+            return None
+        разность = self._снять_обёртки(n["inner"][0])
+        if разность.get("kind") != "BinaryOperator" or разность.get("opcode") != "-" \
+                or len(разность.get("inner", [])) != 2:
+            return None
+        байты = self._снять_обёртки(разность["inner"][0])
+        смещение = self._снять_обёртки(разность["inner"][1])
+        if смещение.get("kind") != "OffsetOfExpr" or байты.get("kind") != "CStyleCastExpr" \
+                or без_квалификаторов(qualtype(байты)).replace(" ", "") != "char*" \
+                or not байты.get("inner"):
+            return None
+        указатель = байты["inner"][0]
+        звено_т = self._развёрнутый_тип(self._снять_обёртки(указатель))
+        if not звено_т.endswith("*"):
+            return None
+        звено_т = звено_т[:-1].strip()
+        тип_т = цель_т[:-1].strip()
+        запись = getattr(self, "все_типы", {}).get(
+            тип_т.replace("struct ", "").replace("union ", "").strip())
+        if not запись:
+            return None
+        поля = [п.get("name") for п in запись.get("inner", [])
+                if п.get("kind") == "FieldDecl"
+                and self._развёрнутый_тип(п) == звено_т and п.get("name")]
+        if len(поля) != 1:
+            return None
+        return тип_т, указатель, поля[0]
+
+    def _интрузивный_цикл(self, n):
+        """«for» из wl_list_for_each[_safe|_reverse|_reverse_safe] → dict или None:
+          for (pos = CONT(Г->next) [, tmp = CONT(pos->m.next)];
+               &pos->m != Г;
+               pos = CONT(pos->m.next) | pos = tmp, tmp = CONT(pos->m.next))
+        (next ↔ prev для обратного обхода)."""
+        вн = list(n.get("inner", []))
+        if len(вн) < 5:
+            return None
+        init, _cv, cond, inc, тело = вн[:5]
+        if not all(isinstance(x, dict) and x.get("kind") for x in (init, cond, inc)):
+            return None
+        с = self._снять_обёртки(cond)
+        if с.get("kind") != "BinaryOperator" or с.get("opcode") != "!=":
+            return None
+        адрес = self._снять_обёртки(с["inner"][0])
+        if адрес.get("kind") != "UnaryOperator" or адрес.get("opcode") != "&":
+            return None
+        член = self._снять_обёртки(адрес["inner"][0])
+        if член.get("kind") != "MemberExpr" or not член.get("isArrow"):
+            return None
+        поле = член.get("name")
+        pos = self._снять_обёртки(член["inner"][0])
+        if pos.get("kind") != "DeclRefExpr":
+            return None
+        pos_id = (pos.get("referencedDecl") or {}).get("id")
+        голова = с["inner"][1]
+        голова_текст = self.выражение(голова)
+
+        def присваивание(x, цель_id):
+            x = self._снять_обёртки(x)
+            if x.get("kind") != "BinaryOperator" or x.get("opcode") != "=":
+                return None
+            л = self._снять_обёртки(x["inner"][0])
+            if л.get("kind") != "DeclRefExpr" \
+                    or (л.get("referencedDecl") or {}).get("id") != цель_id:
+                return None
+            return x["inner"][1]
+
+        def шаг_контейнера(x, база_проверка):
+            """CONT(<база>->поле.dir) или CONT(Г->dir) → (dir, тип_т) или None."""
+            к = self._контейнер(self._снять_обёртки(x))
+            if к is None or к[2] != поле:
+                return None
+            тип_т, указатель, _ = к
+            у = self._снять_обёртки(указатель)
+            if у.get("kind") != "MemberExpr" or у.get("name") not in ("next", "prev"):
+                return None
+            if not база_проверка(self._снять_обёртки(у["inner"][0])):
+                return None
+            return у.get("name"), тип_т
+
+        def это_голова(база):
+            return self.выражение(база) == голова_текст \
+                or f"({self.выражение(база)})" == голова_текст
+
+        def это_звено(имя_id):
+            def проверка(база):
+                return (база.get("kind") == "MemberExpr" and база.get("name") == поле
+                        and self._снять_обёртки(база["inner"][0]).get("kind") == "DeclRefExpr"
+                        and (self._снять_обёртки(база["inner"][0]).get("referencedDecl")
+                             or {}).get("id") == имя_id)
+            return проверка
+
+        части_init = self._разбить_запятую(init)
+        части_inc = self._разбить_запятую(inc)
+        первый = присваивание(части_init[0], pos_id)
+        if первый is None:
+            return None
+        старт = шаг_контейнера(первый, это_голова)
+        if старт is None:
+            return None
+        направление, тип_т = старт
+        tmp_id = None
+        if len(части_init) == 2 and len(части_inc) == 2:          # _safe
+            tmp_узел = self._снять_обёртки(self._снять_обёртки(части_init[1])["inner"][0]) \
+                if self._снять_обёртки(части_init[1]).get("kind") == "BinaryOperator" else {}
+            tmp_id = (tmp_узел.get("referencedDecl") or {}).get("id")
+            втор = присваивание(части_init[1], tmp_id)
+            if втор is None or шаг_контейнера(втор, это_звено(pos_id)) != (направление, тип_т):
+                return None
+            перенос = присваивание(части_inc[0], pos_id)
+            if перенос is None or self._снять_обёртки(перенос).get("kind") != "DeclRefExpr" \
+                    or (self._снять_обёртки(перенос).get("referencedDecl") or {}).get("id") != tmp_id:
+                return None
+            след = присваивание(части_inc[1], tmp_id)
+            if след is None or шаг_контейнера(след, это_звено(pos_id)) != (направление, тип_т):
+                return None
+        elif len(части_init) == 1 and len(части_inc) == 1:
+            след = присваивание(части_inc[0], pos_id)
+            if след is None or шаг_контейнера(след, это_звено(pos_id)) != (направление, тип_т):
+                return None
+        else:
+            return None
+        return {"pos": pos, "pos_id": pos_id, "tmp_id": tmp_id, "тип": тип_т,
+                "поле": поле, "голова": голова, "обратно": направление == "prev",
+                "с_удалением": tmp_id is not None, "тело": тело}
+
+    def _собрать_интрузивные_циклы(self, тело_ф):
+        """Пред-скан функции: переводимые интрузивные циклы (id ForStmt → dict) и
+        id объявлений их переменных-курсоров, которые НЕ используются вне этих
+        циклов (такие объявления снимаются: курсор объявляет «для_каждого»).
+        Курсор, живущий и после цикла, → цикл не переводим (прежний путь)."""
+        циклы = {}
+        for у in self._все_узлы(тело_ф):
+            if у.get("kind") == "ForStmt":
+                инфо = self._интрузивный_цикл(у)
+                if инфо is not None:
+                    циклы[у.get("id")] = (у, инфо)
+        внутри = {}                       # id узла → id объемлющего цикла
+        for fid, (у, _) in циклы.items():
+            for х in self._все_узлы(у):
+                внутри.setdefault(id(х), fid)
+        снаружи = set()
+        for х in self._все_узлы(тело_ф):
+            if х.get("kind") == "DeclRefExpr" and id(х) not in внутри:
+                снаружи.add((х.get("referencedDecl") or {}).get("id"))
+        годные, скрыть = {}, set()
+        for fid, (у, инфо) in циклы.items():
+            курсоры = [инфо["pos_id"]] + ([инфо["tmp_id"]] if инфо["tmp_id"] else [])
+            if any(к in снаружи for к in курсоры):
+                continue
+            годные[fid] = инфо
+            скрыть.update(курсоры)
+        return годные, скрыть
+
+    def _интрузивный_для(self, инфо, ур):
+        """Эмит «для_каждого курсор из интрузивный<T>(голова, поле, …)» (§121)
+        под «небезопасно» (целостность C-списка язык не доказывает)."""
+        голова = self._снять_обёртки(инфо["голова"])
+        if голова.get("kind") == "UnaryOperator" and голова.get("opcode") == "&":
+            голова_с = self.выражение(голова["inner"][0])       # звено-lvalue
+        else:
+            голова_с = self.выражение(голова)                  # указатель на звено
+        режимы = (", обратно" if инфо["обратно"] else "") \
+            + (", с_удалением" if инфо["с_удалением"] else "")
+        обёртка = not self.внутри_небезопасно
+        if обёртка:
+            self.добавить_пометку("небезопасно-указатель", инфо["pos"],
+                                 деталь="интрузивный список (wl_list) — целостность "
+                                        "C-списка не проверяется", ур=ур)
+            self.эмит(ур, "небезопасно {")
+            self.внутри_небезопасно = True
+        у = ур + (1 if обёртка else 0)
+        self.эмит(у, f"для_каждого {self.выражение(инфо['pos'])} из "
+                     f"интрузивный<{конда_тип(инфо['тип'])}>({голова_с}, "
+                     f"{инфо['поле']}{режимы}) {{")
+        self.тело(инфо["тело"], у)
+        self.эмит(у, "}")
+        if обёртка:
+            self.внутри_небезопасно = False
+            self.эмит(ур, "}")
 
     @contextlib.contextmanager
     def _место_выноса(self, ур, пост):
@@ -1055,6 +1267,11 @@ class Конвертер:
             части = []
             for i, c in enumerate(вн):
                 if i < len(поля):
+                    # Неявный ноль недописанного поля («{ 1 }» при двух полях):
+                    # опускаем — C-инициализатор обнуляет недостающие поля сам,
+                    # а «поле = 0» для поля-структуры несовместимо по типу.
+                    if c.get("kind") == "ImplicitValueInitExpr":
+                        continue
                     части.append(f"{поля[i]} = {self.выражение(c)}")
                 else:
                     части.append(self.выражение(c))
@@ -1505,6 +1722,10 @@ class Конвертер:
             return
         if d.get("id") in self.владение.пропустить_объявления:
             return          # «T *p = &x» — вместо «p» печатаем «x» (подстановка)
+        # id объявлений уникализированы префиксом файла («ф0_0x…», см.
+        # _перепривязать_id), а referencedDecl у ссылок — сырой («0x…»).
+        if str(d.get("id", "")).split("_", 1)[-1] in getattr(self, "интрузивные_курсоры", ()):
+            return          # курсор wl_list_for_each — его объявляет «для_каждого»
         if d.get("id") in getattr(self, "сл_подавить", ()):
             return          # «struct T *cv = data» в колбэке слушателя — cv стал параметром
         if d.get("kind") == "StaticAssertDecl":
@@ -2148,6 +2369,10 @@ class Конвертер:
         self.эмит(ур, "}")
 
     def цикл_для(self, n, ур):
+        инфо = getattr(self, "интрузивные_циклы", {}).get(n.get("id"))
+        if инфо is not None:
+            self._интрузивный_для(инфо, ур)
+            return
         вн = list(n.get("inner", []))
         while len(вн) < 5:
             вн.append({})
@@ -3221,6 +3446,8 @@ class Конвертер:
         тело_ф = next((c for c in f.get("inner", [])
                        if c.get("kind") == "CompoundStmt"), None)
         self.буфер_переменные = self._собрать_буферы(тело_ф) if тело_ф else set()
+        self.интрузивные_циклы, self.интрузивные_курсоры = (
+            self._собрать_интрузивные_циклы(тело_ф) if тело_ф else ({}, set()))
         self.подстановки = self.владение.подстановки_функции(исходное_имя)
         self.переименования = {}
         # A-3: множество известных имён типов для shadow-конфликт-переименования
@@ -3570,6 +3797,7 @@ def сгенерировать(декларации, политика, исхо�
     # «внешний слушатель<T>» + экземпляр + «слушать» (каст void*→T уходит в
     # сгенерированный трампулин транспилятора).
     к._анализ_слушателей(декларации, все_типы or {})
+    к.все_типы = все_типы or {}     # записи всех заголовков — поля для container_of
     for d in декларации:                       # 1-й проход: поля структур/union
         if d.get("kind") == "RecordDecl" and d.get("name"):
             к.регистрация_записи(d)
