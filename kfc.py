@@ -647,6 +647,21 @@ class Конвертер:
                 return str(v)
         if k == "StringLiteral":
             return раскодировать_строку(n.get("value", '""'))
+        if k == "PredefinedExpr":
+            # C «__func__»/«__FUNCTION__»/«__PRETTY_FUNCTION__» → встроенная Konda
+            # «имя_функции()» (§118 транспилятора): имя объемлющей функции,
+            # проверенное компилятором. Имена функций kfc переносит как есть —
+            # КРОМЕ «main» → «точка_входа»: там имя_функции() дало бы
+            # "точка_входа", а C печатал "main" → сохраняем исходный литерал
+            # (clang кладёт его вложенным StringLiteral), поведение не меняется.
+            литерал = next((р for р in вн if isinstance(р, dict)
+                            and р.get("kind") == "StringLiteral"), None)
+            if n.get("name") in ("__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"):
+                if литерал is not None and литерал.get("value") == '"main"':
+                    return раскодировать_строку(литерал["value"])
+                return "имя_функции()"
+            if литерал is not None:
+                return раскодировать_строку(литерал.get("value", '""'))
         if k == "DeclRefExpr":
             имя_д = self.имя_ссылки(n)
             # «T *p = &x» подставлен: «p» — это просто другое имя для «x»
