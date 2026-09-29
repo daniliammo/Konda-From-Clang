@@ -803,6 +803,9 @@ class Конвертер:
             return n.get("value", "0")
         if k == "FloatingLiteral":
             v = n.get("value", "0.0")
+            макрос = self._имя_вещественного_макроса(n, v)
+            if макрос:
+                return макрос
             # clang роняет «.0» у целых float («2.0»→«2», «100.0»→«100»). Без
             # точки Konda сочтёт литерал ЦЕЛЫМ → целочисленное деление и тип
             # («(a+b)/2.0» дало бы int-деление). Возвращаем дробную форму.
@@ -1370,6 +1373,32 @@ class Конвертер:
             yield пост
         finally:
             self.тек_ур, self.пост_побочки, self.условная_глубина = сохранено
+
+    def _имя_вещественного_макроса(self, n, значение):
+        """FloatingLiteral из раскрытия ОБЪЕКТНОГО макроса-литерала (DBL_MAX,
+        M_PI) → имя макроса, иначе None. Имя берётся из текста исходника в
+        месте раскрытия и принимается, только если это известный макрос-литерал
+        с тем же числовым значением (иначе — часть выражения/аргумент макроса)."""
+        начало = (n.get("range") or {}).get("begin") or {}
+        раскрытие = начало.get("expansionLoc")
+        if not раскрытие or "spellingLoc" not in начало or раскрытие.get("isMacroArgExpansion"):
+            return None
+        смещение, длина = раскрытие.get("offset"), раскрытие.get("tokLen")
+        if смещение is None or not длина or not self.исходник_c:
+            return None
+        байты = getattr(self, "_байты_исходника", None)
+        if байты is None:
+            байты = ("\n".join(self.исходник_c)).encode("utf-8", "replace")
+            self._байты_исходника = байты
+        имя = байты[смещение:смещение + длина].decode("utf-8", "replace")
+        if имя not in ВЕЩЕСТВЕННЫЕ_МАКРОСЫ:
+            return None
+        try:
+            if float(значение) != ВЕЩЕСТВЕННЫЕ_МАКРОСЫ[имя]:
+                return None
+        except ValueError:
+            return None
+        return имя
 
     def _арифм_операнд(self, узел) -> str:
         """Операнд арифметики. C повышает «char» до «int» неявно; в Konda
@@ -4015,12 +4044,49 @@ def _завершён(операторы):
     return False
 
 
+# Объектные макросы, раскрывающиеся ровно в ОДИН вещественный литерал
+# (DBL_MAX, M_PI, FLT_EPSILON…): имя → значение (float). Заполняет дамп_clang
+# по «clang -dM -E»; FloatingLiteral из раскрытия такого макроса печатается его
+# ИМЕНЕМ (транспилятор знает макросы заголовков, §117) — читаемее числа.
+ВЕЩЕСТВЕННЫЕ_МАКРОСЫ = {}
+_ВЕЩ_ЛИТЕРАЛ = re.compile(r"[-+]?(\d+\.\d*|\.\d+|\d+)([eE][-+]?\d+)?[fFlL]?$")
+
+
+def _собрать_вещественные_макросы(путь, доп):
+    """«clang -dM -E» с теми же флагами → ВЕЩЕСТВЕННЫЕ_МАКРОСЫ (цепочки
+    «#define DBL_MAX __DBL_MAX__» проходятся; скобки снимаются). Литерал
+    обязан содержать точку или экспоненту (иначе это целый макрос)."""
+    proc = subprocess.run(["clang", "-dM", "-E", путь] + доп, capture_output=True,
+                          text=True, errors="replace")
+    определения = {}
+    for строка in (proc.stdout or "").splitlines():
+        m = re.match(r"#define\s+([A-Za-z_]\w*)\s+(.*)$", строка)
+        if m:                       # «#define F(x) …» сюда не попадёт: «(» после имени
+            определения[m.group(1)] = m.group(2).strip()
+    for имя in определения:
+        значение, шаги = определения[имя], 0
+        while шаги < 8:
+            значение = значение.strip()
+            while значение.startswith("(") and значение.endswith(")"):
+                значение = значение[1:-1].strip()
+            if значение in определения:
+                значение, шаги = определения[значение], шаги + 1
+                continue
+            break
+        if _ВЕЩ_ЛИТЕРАЛ.match(значение) and re.search(r"[.eE]", значение.rstrip("fFlL")):
+            try:
+                ВЕЩЕСТВЕННЫЕ_МАКРОСЫ[имя] = float(значение.rstrip("fFlL"))
+            except ValueError:
+                pass
+
+
 def дамп_clang(путь, доп, игнорировать_ошибки=False):
     if not shutil.which("clang"):
         sys.stderr.write("ошибка: clang не найден в PATH\n")
         sys.exit(2)
     cmd = ["clang", "-Xclang", "-ast-dump=json", "-fsyntax-only", путь] + доп
     proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    _собрать_вещественные_макросы(путь, доп)
     # clang продолжает дамп и после fatal error (например, не найден заголовок),
     # но AST при этом НЕПОЛНЫЙ и типы в нём битые — молча переводить такое
     # значит выдать неверный код. По умолчанию отказываемся и показываем, чего
