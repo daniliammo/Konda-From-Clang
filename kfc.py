@@ -4262,7 +4262,31 @@ def замкнуть_типы(единицы, реф_типы=None):
                  if _полный(д) and д.get("name")}
     for е in единицы:
         очередь = [д for д in е.декларации if д.get("kind") == "RecordDecl"]
-        for имя_т in (реф_типы or {}).get(id(е), set()):
+        # Затравки из ФУНКЦИЙ проекта: by-value локальные переменные,
+        # параметры и возврат типа записи/перечисления из заголовка
+        # («struct v4l2_format fmt;», «enum wl_output_transform t;») — без
+        # определения Konda не знает имени типа («ожидался тип»).
+        затравки = set((реф_типы or {}).get(id(е), set()))
+        for д in е.декларации:
+            if д.get("kind") != "FunctionDecl":
+                continue
+            типы = [qualtype(д).split("(")[0]]
+            стек = list(д.get("inner", []))
+            while стек:
+                у = стек.pop()
+                if not isinstance(у, dict):
+                    continue
+                if у.get("kind") in ("VarDecl", "ParmVarDecl"):
+                    типы.append(qualtype(у))
+                стек.extend(у.get("inner", []))
+            for qt in типы:
+                qt = без_квалификаторов(qt)
+                if "*" in qt or "(" in qt:
+                    continue
+                имя_т = _имя_польз_типа(qt)
+                if имя_т:
+                    затравки.add(имя_т)
+        for имя_т in sorted(затравки):
             if имя_т not in известные and имя_т in е.все_типы:
                 новый = е.все_типы[имя_т]
                 е.декларации.insert(0, новый)
