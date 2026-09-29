@@ -1260,7 +1260,34 @@ class Конвертер:
         else:
             self.эмит(ур, стр)
 
+    def _условие_assert(self, n):
+        """C «assert(усл)» (раскрытый libc-макрос) → узел условия или None.
+        glibc: «(void)sizeof(усл?1:0), __extension__ ({ if (усл) ; else
+        __assert_fail(…); })» — ищем StmtExpr с IfStmt, чья ветка «иначе» —
+        вызов функции-провала assert (glibc/musl/BSD/macOS). NDEBUG-сборка
+        раскрывает assert в «(void)0» — там провала нет и ничего не эмитим."""
+        for у in self._все_узлы(n):
+            if у.get("kind") != "IfStmt" or not у.get("hasElse"):
+                continue
+            дети = [c for c in у.get("inner", []) if isinstance(c, dict)]
+            if len(дети) < 3:
+                continue
+            провал = self.развернуть(дети[-1])
+            if провал.get("kind") == "CompoundStmt" and провал.get("inner"):
+                провал = self.развернуть(провал["inner"][0])
+            if провал.get("kind") == "CallExpr" and _имя_вызова(провал) in (
+                    "__assert_fail", "__assert", "__assert_rtn", "__assert2"):
+                return дети[0]
+        return None
+
     def оператор_выражение(self, n, ур):
+        # C «assert(усл)» → встроенная Konda «утверждать(усл)» (§120): проверка
+        # с текстом условия, строкой и функцией; работает и в релизе.
+        усл_assert = self._условие_assert(n)
+        if усл_assert is not None:
+            self._эмит_оператор_строку(
+                f"утверждать({self._истинность(усл_assert)})", усл_assert, ур)
+            return
         # free(срез) отбрасываем — у среза автоосвобождение (autofree)
         внр = self.развернуть(n)
         # Регистрация слушателя: X_add_listener(obj, &G, data) → слушать(...).
