@@ -870,11 +870,15 @@ class Конвертер:
             self._тернарник_в_если(f"{тип} {t}", t, n, ур)
             return t
         if k == "UnaryExprOrTypeTraitExpr":       # sizeof
+            # «размер_обьекта» Konda принимает ТИП (не выражение): для
+            # «sizeof(выражение)» берём тип операнда у clang. Массив — как
+            # «размер_обьекта(T) * N» (конда_тип приближает массив указателем,
+            # и «sizeof(буфер)» дал бы размер указателя).
             арг = n.get("argType", {})
             if isinstance(арг, dict) and арг.get("qualType"):
-                return f"размер_обьекта({конда_тип(арг['qualType'])})"
+                return self._размер_типа(арг)
             if вн:
-                return f"размер_обьекта({self.выражение(вн[0])})"
+                return self._размер_типа(вн[0].get("type", {}))
             return "размер_обьекта(целое32)"
         if k == "InitListExpr":
             return self._инициализатор(n)
@@ -974,6 +978,24 @@ class Конвертер:
             if isinstance(x, dict):
                 yield x
                 стек.extend(c for c in x.get("inner", []) if isinstance(c, dict))
+
+    @staticmethod
+    def _размер_типа(тип) -> str:
+        """clang-тип ({qualType, desugaredQualType}) → Konda-выражение размера:
+        «размер_обьекта(T)» или «размер_обьекта(T) * N * M» для массива."""
+        qt = без_квалификаторов(тип.get("qualType", "int") if isinstance(тип, dict)
+                                else str(тип))
+        м = re.fullmatch(r"(.*?)\s*((?:\[\d+\])+)", qt)
+        if м is None and isinstance(тип, dict) and тип.get("desugaredQualType"):
+            # typedef массива («typedef float матрица[16]») — размерности в
+            # развёрнутом типе.
+            м = re.fullmatch(r"(.*?)\s*((?:\[\d+\])+)",
+                             без_квалификаторов(тип["desugaredQualType"]))
+        if м is None:
+            return f"размер_обьекта({конда_тип(qt)})"
+        база, размерности = м.group(1), re.findall(r"\[(\d+)\]", м.group(2))
+        return f"размер_обьекта({конда_тип(база)})" + "".join(
+            f" * {р}" for р in размерности)
 
     def _инициализатор(self, n) -> str:
         """InitListExpr → «{ поле = знач }» для структуры, «{ a, b }» для массива."""
