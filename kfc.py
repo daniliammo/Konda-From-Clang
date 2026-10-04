@@ -2159,8 +2159,10 @@ class Конвертер:
             self.срез_переменные.add(имя)
             self.эмит(ур, f"{префикс}срез<{kt[:-1]}> {имя} = {self.выражение(иниц)}")
             return
+        # Анализ нулевости знает ИСХОДНОЕ имя C (локаль могла переименоваться
+        # «buffer» → «buffer_» из-за совпадения с типом — A-3).
         нулевая = (kt.endswith("*") and not массив
-                   and self.нулевые.нулевой(self.тек_исходное_имя, имя))
+                   and self.нулевые.нулевой(self.тек_исходное_имя, сырое_имя))
         объ = (f"{префикс}возможно<{kt}> {имя}" if нулевая
                else f"{префикс}{kt} {имя}")
         if массив:
@@ -4672,6 +4674,260 @@ def _поднять_вложенные_аноним_записи(деклара�
     обработать(декларации)
 
 
+# ─── Подстановка алиаса «T *p = &LVAL» ───────────────────────────────────────
+# Самый частый «адрес-оф» реального C: указатель на элемент/поле, живущее
+# дольше функции, — «struct buffer *b = &d->buffers[i]; b->busy = 1; f(b);».
+# В Konda «&» нет, но такой указатель — лишь КОРОТКОЕ ИМЯ для lvalue: если «p»
+# присвоен только в объявлении, а части LVAL (база, индексы, члены пути) в его
+# области не меняются, каждое использование можно заменить самим LVAL:
+#   «p->поле» → «LVAL.поле», «*p» → «LVAL», «f(p)» → «f(&LVAL)» (дальше
+# обычный перевод kfc делает параметр «изменяемый» — ссылка на проекцию §21).
+# Любое иное использование «p» (сравнение, сохранение, возврат, арифметика) —
+# откат: объявление остаётся непереводимым, как прежде.
+
+def _без_оберток(n):
+    while isinstance(n, dict) and n.get("kind") in ("ImplicitCastExpr", "ParenExpr") \
+            and n.get("inner"):
+        n = n["inner"][0]
+    return n
+
+
+def _ссылка_на(n, ид):
+    n = _без_оберток(n)
+    return isinstance(n, dict) and n.get("kind") == "DeclRefExpr" \
+        and (n.get("referencedDecl") or {}).get("id") == ид
+
+
+def _путь_lvalue(n, переменные, члены):
+    """LVAL из баз-переменных, «.»/«->», индексов-переменных/литералов → True;
+    собирает id переменных и имена членов пути."""
+    n = _без_оберток(n)
+    if not isinstance(n, dict):
+        return False
+    k = n.get("kind")
+    if k == "DeclRefExpr":
+        реф = n.get("referencedDecl") or {}
+        if реф.get("kind") not in ("VarDecl", "ParmVarDecl"):
+            return False
+        переменные.add(реф.get("id"))
+        return True
+    if k == "MemberExpr":
+        члены.add(n.get("name"))
+        return _путь_lvalue((n.get("inner") or [None])[0], переменные, члены)
+    if k == "ArraySubscriptExpr":
+        база, индекс = (n.get("inner") or [None, None])[:2]
+        инд = _без_оберток(индекс)
+        if not isinstance(инд, dict):
+            return False
+        if инд.get("kind") == "DeclRefExpr":
+            if (инд.get("referencedDecl") or {}).get("kind") not in ("VarDecl", "ParmVarDecl"):
+                return False
+            переменные.add(инд["referencedDecl"].get("id"))
+        elif инд.get("kind") != "IntegerLiteral":
+            return False
+        return _путь_lvalue(база, переменные, члены)
+    return False
+
+
+def _меняет(n, переменные, члены):
+    """Есть ли в поддереве запись в переменную из набора (=, op=, ++/--, &x)
+    или присваивание члену с именем из пути."""
+    стек = [n]
+    while стек:
+        у = стек.pop()
+        if not isinstance(у, dict):
+            continue
+        k = у.get("kind")
+        цель = None
+        if k in ("BinaryOperator", "CompoundAssignOperator") \
+                and (k == "CompoundAssignOperator" or у.get("opcode") == "="):
+            цель = (у.get("inner") or [None])[0]
+        elif k == "UnaryOperator" and у.get("opcode") in ("++", "--", "&"):
+            цель = (у.get("inner") or [None])[0]
+        if цель is not None:
+            ц = _без_оберток(цель)
+            if isinstance(ц, dict):
+                if ц.get("kind") == "DeclRefExpr" \
+                        and (ц.get("referencedDecl") or {}).get("id") in переменные:
+                    return True
+                if ц.get("kind") == "MemberExpr" and ц.get("name") in члены \
+                        and k != "UnaryOperator":
+                    return True
+        стек.extend(у.get("inner", []))
+    return False
+
+
+def _подставить_в(n, ид, иниц, lval, счёт):
+    """Заменяет использования «p» (ид) в поддереве n. → (новый_узел, ок)."""
+    if not isinstance(n, dict):
+        return n, True
+    k = n.get("kind")
+
+    def копия(узел):
+        счёт[0] += 1
+        к = copy.deepcopy(узел)
+        def переим(x):
+            if isinstance(x, dict):
+                if "id" in x:
+                    x["id"] = f"{x['id']}ал{счёт[0]}"
+                for c in x.get("inner", []):
+                    переим(c)
+        переим(к)
+        return к
+
+    if k == "MemberExpr" and n.get("isArrow") and n.get("inner") \
+            and _ссылка_на(n["inner"][0], ид):
+        n["inner"][0] = копия(lval)
+        n["isArrow"] = False
+        return n, True
+    if k == "UnaryOperator" and n.get("opcode") == "*" and n.get("inner") \
+            and _ссылка_на(n["inner"][0], ид):
+        return копия(lval), True
+    if k == "CallExpr":
+        дети = n.get("inner", [])
+        for i, а in enumerate(дети[1:], 1):
+            if _ссылка_на(а, ид):
+                дети[i] = копия(иниц)
+            else:
+                дети[i], ок = _подставить_в(а, ид, иниц, lval, счёт)
+                if not ок:
+                    return n, False
+        if дети and _ссылка_на(дети[0], ид):
+            return n, False
+        if дети:
+            дети[0], ок = _подставить_в(дети[0], ид, иниц, lval, счёт)
+            return n, ок
+        return n, True
+    if k == "DeclRefExpr" and (n.get("referencedDecl") or {}).get("id") == ид:
+        return n, False      # иное использование «p» — не подставляем
+    дети = n.get("inner", [])
+    for i, c in enumerate(дети):
+        дети[i], ок = _подставить_в(c, ид, иниц, lval, счёт)
+        if not ок:
+            return n, False
+    return n, True
+
+
+def _число_ссылок(n, ид):
+    """Сколько раз поддерево ссылается на переменную ид."""
+    if not isinstance(n, dict):
+        return 0
+    своя = 1 if n.get("kind") == "DeclRefExpr" \
+        and (n.get("referencedDecl") or {}).get("id") == ид else 0
+    return своя + sum(_число_ссылок(c, ид) for c in n.get("inner", []))
+
+
+def _подставить_алиасы_адресов(декларации):
+    счёт = [0]
+    функция = [None]
+
+    def попробовать(дети, i, ид, и, удалить):
+        """Подставить алиас «ид» = «и» (&LVAL) в дети[i+1:]; при успехе
+        удалить дети[i] (объявление/присваивание). → успех."""
+        lval = (и.get("inner") or [None])[0]
+        переменные, члены = set(), set()
+        if not _путь_lvalue(lval, переменные, члены):
+            return False
+        хвост = дети[i + 1:]
+        if any(_меняет(с, переменные | {ид}, члены) for с in хвост):
+            return False
+        пробные = copy.deepcopy(хвост)
+        for j, с in enumerate(пробные):
+            пробные[j], ок = _подставить_в(с, ид, и, lval, счёт)
+            if not ок:
+                return False
+        дети[i + 1:] = пробные
+        if удалить:
+            del дети[i]
+        return True
+
+    def присваивание_алиаса(ст):
+        """«p = &LVAL;» оператором → (ид p, узел &LVAL) или None."""
+        if not (isinstance(ст, dict) and ст.get("kind") == "BinaryOperator"
+                and ст.get("opcode") == "=" and len(ст.get("inner", [])) == 2):
+            return None
+        цель, знач = ст["inner"]
+        цель = _без_оберток(цель)
+        и = _без_оберток(знач)
+        if not (isinstance(цель, dict) and цель.get("kind") == "DeclRefExpr"
+                and (цель.get("referencedDecl") or {}).get("kind") == "VarDecl"
+                and "*" in qualtype(цель)
+                and isinstance(и, dict) and и.get("kind") == "UnaryOperator"
+                and и.get("opcode") == "&"):
+            return None
+        return цель["referencedDecl"].get("id"), и
+
+    def блок(b):
+        if not isinstance(b, dict):
+            return
+        for c in b.get("inner", []):
+            блок(c)                       # вложенные блоки — сначала
+        if b.get("kind") != "CompoundStmt":
+            return
+        дети = b.get("inner", [])
+        i = 0
+        while i < len(дети):
+            ст = дети[i]
+            # «p = &LVAL;» оператором (C89: «struct T *p;» выше): только если ВСЕ
+            # ссылки на «p» в функции — в остатке этого блока (иначе код вне
+            # области увидел бы «p» без значения) и других присваиваний нет.
+            пара = присваивание_алиаса(ст)
+            if пара:
+                ид, и = пара
+                всего = _число_ссылок(функция[0], ид)
+                в_хвосте = sum(_число_ссылок(с, ид) for с in дети[i + 1:])
+                if всего == в_хвосте + 1 and попробовать(дети, i, ид, и, удалить=True):
+                    убрать_объявление(функция[0], ид)
+                    continue
+                i += 1
+                continue
+            вар = (ст.get("inner") or [None]) if isinstance(ст, dict) else [None]
+            if not (isinstance(ст, dict) and ст.get("kind") == "DeclStmt"
+                    and len(вар) == 1 and isinstance(вар[0], dict)
+                    and вар[0].get("kind") == "VarDecl"):
+                i += 1
+                continue
+            v = вар[0]
+            иниц = next((x for x in reversed(v.get("inner", []))
+                         if isinstance(x, dict) and "Attr" not in x.get("kind", "")), None)
+            и = _без_оберток(иниц) if иниц else None
+            if not (и and и.get("kind") == "UnaryOperator" and и.get("opcode") == "&"
+                    and "*" in qualtype(v)):
+                i += 1
+                continue
+            # Объявление с инициализатором: область «p» — остаток блока (C).
+            if not попробовать(дети, i, v.get("id"), и, удалить=True):
+                i += 1
+
+    def убрать_объявление(корень, ид):
+        """Объявление «p» без инициализатора (или «= NULL»), на которое больше
+        нет ссылок, — убрать (одиночный VarDecl в DeclStmt)."""
+        if _число_ссылок(корень, ид):
+            return
+        def обход(n):
+            if not isinstance(n, dict):
+                return False
+            дети = n.get("inner", [])
+            for j, c in enumerate(дети):
+                if isinstance(c, dict) and c.get("kind") == "DeclStmt" \
+                        and len(c.get("inner", [])) == 1 \
+                        and c["inner"][0].get("id") == ид:
+                    иниц = [x for x in c["inner"][0].get("inner", [])
+                            if isinstance(x, dict) and "Attr" not in x.get("kind", "")]
+                    if not иниц or нул.это_нуль(иниц[-1]):
+                        del дети[j]
+                    return True
+                if обход(c):
+                    return True
+            return False
+        обход(корень)
+
+    for д in декларации:
+        if isinstance(д, dict) and д.get("kind") == "FunctionDecl":
+            функция[0] = д
+            блок(д)
+
+
 def _перепривязать_id(узлы, префикс):
     """Уникализирует id узлов clang между файлами проекта: id — это адреса
     памяти clang и МОГУТ совпасть между независимыми запусками, а политика
@@ -4786,6 +5042,7 @@ class Единица:
                 self.все_типы[имя_у] = c
         _именовать_анонимные(self.декларации)
         _поднять_вложенные_аноним_записи(self.декларации)
+        _подставить_алиасы_адресов(self.декларации)
         _перепривязать_id(self.декларации, f"ф{номер}_")
         try:
             with open(путь, encoding="utf-8", errors="replace") as fh:
