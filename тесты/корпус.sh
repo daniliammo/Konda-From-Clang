@@ -28,7 +28,11 @@ find "$SRC" -maxdepth 1 -name '*.c' -print0 | xargs -0 -P "$JOBS" -I{} sh -c '
     ( cd "$(dirname "$f")" && timeout 300 python3 "$ROOT/kfc.py" --без-проверки "$f" \
         -o "$OUT/$b.конда" --отчёт "$OUT/$b.json" >"$OUT/$b.kfc.log" 2>&1 ) || true
     if [ -f "$OUT/$b.конда" ]; then
-        ( cd "$OUT" && "$TRBIN" --только-си "$b.конда" >"$OUT/$b.tr.log" 2>&1 \
+        # Флаги C (-I/-D, §129 транспилятора) — из отчёта kfc: те же, что видел clang.
+        ( cd "$OUT" && python3 -c "import json,os,sys
+ф = json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"флаги_транспилятора\", [])
+os.execvp(sys.argv[2], [sys.argv[2]] + ф + sys.argv[3:])" \
+            "$OUT/$b.json" "$TRBIN" --только-си "$b.конда" >"$OUT/$b.tr.log" 2>&1 \
             && echo ok >"$OUT/$b.tr.ok" ) || true
     fi' _ {}
 
