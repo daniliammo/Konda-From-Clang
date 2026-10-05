@@ -232,10 +232,50 @@ def _ширина_целого(qt: str):
     return None
 
 
+# typedef МАССИВА («typedef float vec3[3]») → (база «float», измерения «[3]»).
+# Заполняется при разборе единиц (_учесть_типедеф_массива).
+МАССИВЫ_ТИПЕДЕФОВ = {}
+# typedef ФУНКЦИОНАЛЬНОГО типа («typedef int f_t(int)»; не указателя): печатается
+# «типфункции», а «f_t *» в использованиях — просто «f_t» (значение типфункции
+# в Konda и есть указатель на функцию).
+ТИПЕДЕФЫ_ФУНКЦИЙ = set()
+_ТИП_ФУНКЦИИ = re.compile(r"^([^()]+?)\s*\(([^()]*)\)$")   # «int (int)»
+
+
+def _учесть_типедеф_массива(узел):
+    qt = ((узел.get("type") or {}).get("qualType") or "")
+    m = re.match(r"^(.*?)\s*((?:\[\d*\])+)$", qt.strip())
+    if m and узел.get("name") and "(" not in qt:
+        МАССИВЫ_ТИПЕДЕФОВ[узел["name"]] = (m.group(1).strip(), m.group(2))
+    if узел.get("name") and _ТИП_ФУНКЦИИ.match(без_квалификаторов(qt)):
+        ТИПЕДЕФЫ_ФУНКЦИЙ.add(узел["name"])
+
+
+def _развернуть_типедеф_массива(qt):
+    """«const vec3[2]» → «const float[2][3]» (внешние измерения — первыми)."""
+    m = re.match(r"^((?:const |volatile )*)([^\W\d]\w*)\s*((?:\[\d*\])*)$", qt.strip())
+    if not m or m.group(2) not in МАССИВЫ_ТИПЕДЕФОВ:
+        return qt
+    база, изм = МАССИВЫ_ТИПЕДЕФОВ[m.group(2)]
+    return f"{m.group(1)}{база}{m.group(3)}{изм}"
+
+
 def qualtype(n) -> str:
     t = n.get("type")
     if isinstance(t, dict):
-        return t.get("qualType", "int")
+        qt = t.get("qualType", "int")
+        # «typeof(выр)»/«__typeof__(…)» (раскрытия макросов: container_of,
+        # g_clear_pointer) — тип выражения знает clang: берём развёрнутый.
+        if "typeof" in qt and t.get("desugaredQualType"):
+            return t["desugaredQualType"]
+        # typedef МАССИВА («typedef float vec3[3]»; «vec3 v[6]» = float[6][3]) —
+        # Konda typedef'ов массивов нет: берём развёрнутый тип с измерениями.
+        дс = t.get("desugaredQualType")
+        if дс and дс.count("[") > qt.count("[") and "(" not in дс:
+            return дс
+        if МАССИВЫ_ТИПЕДЕФОВ:
+            return _развернуть_типедеф_массива(qt)
+        return qt
     if isinstance(t, str):
         return t
     return "int"
@@ -259,6 +299,12 @@ def конда_тип(qt: str) -> str:
     if основа_п in ПСЕВДОНИМЫ_ЗАПИСЕЙ:          # typedef-псевдоним записи
         t = ПСЕВДОНИМЫ_ЗАПИСЕЙ[основа_п] + " " + "*" * t.count("*")
         t = t.strip()
+    if основа_п in ТИПЕДЕФЫ_ФУНКЦИЙ:            # «f_t *» → типфункции «f_t»
+        return основа_п + "*" * max(t.count("*") - 1, 0)
+    # Анонимный enum («enum { A, B } поле», «enum (unnamed enum at …)»): по ABI —
+    # int; константы транспилятор берёт из C (§127) или kfc печатает «конст».
+    if re.match(r"enum \((unnamed|anonymous)", t) and "*" not in t:
+        return "целое32"
     if "(" in t and ")" in t and "(*" not in t:
         return "/*функц-тип*/ ничего"       # тип функции — вне охвата
     указатели = t.count("*")
@@ -879,7 +925,12 @@ class Конвертер:
             if (имя_б in self.ссылочные_имена or имя_б in self.подстановки) \
                     and self.выражение(вн[1]) == "0":
                 return self.выражение(вн[0])
-            return f"{self.выражение(вн[0])}[{self.выражение(вн[1])}]"
+            база_с = self.выражение(вн[0])
+            # «как<T*>(п)[i]» — постфикс после каста грамматика Konda не берёт:
+            # «(как<T*>(п))[i]».
+            if база_с.startswith("как<"):
+                база_с = f"({база_с})"
+            return f"{база_с}[{self.выражение(вн[1])}]"
         if k == "BinaryOperator":
             оп = n.get("opcode", "?")
             оп = {"&&": "и", "||": "или"}.get(оп, оп)
@@ -946,6 +997,13 @@ class Конвертер:
                 # «*p» подставленного указателя и параметра-ссылки — сам объект
                 if имя_о in self.подстановки or имя_о in self.ссылочные_имена:
                     return опнд
+                # «(*fp)(…)» — разыменование указателя на ФУНКЦИЮ: в C тождество
+                # (результат — тип-функция «R (A…)»), в Konda вызов «fp(…)».
+                тр = без_квалификаторов(qualtype(n))
+                if "(" in тр and "(*" not in тр and "[" not in тр:
+                    return опнд
+                if опнд.startswith("как<"):        # постфикс после каста — в скобках
+                    опнд = f"({опнд})"
                 return f"{опнд}[0]"              # разыменование → [0]
             if оп == "&":
                 # «&x» в аргументе для «изменяемый»/«вывод» просто исчезает —
@@ -953,13 +1011,43 @@ class Конвертер:
                 if n.get("id") in self.владение.снятые_амперсанды:
                     return опнд
                 return f"/*&*/{опнд}"            # помечено; заблокирован() отловит
-            if оп in ("-", "+", "!", "~"):
+            if оп == "+":
+                return опнд                      # унарного «+» в Konda нет (тождество)
+            if оп in ("-", "!", "~"):
                 return f"{оп}{опнд}"
             return f"{оп}{опнд}"
         if k == "CallExpr":
-            callee = self.выражение(вн[0]) if вн else "?"
+            # Вызываемое без внешних скобок: «(*w->обработчик)(…)» → «w.обработчик(…)»
+            # (оператор, начинающийся с «(», Konda не разбирает).
+            выз = вн[0] if вн else None
+            while isinstance(выз, dict) and выз.get("kind") in ("ParenExpr", "ImplicitCastExpr") \
+                    and выз.get("inner"):
+                выз = выз["inner"][0]
+            callee = self.выражение(выз) if выз is not None else "?"
+            while callee.startswith("(") and callee.endswith(")") \
+                    and _скобки_парные(callee):
+                callee = callee[1:-1]
             арги = ", ".join(self.выражение(a) for a in вн[1:])
             return f"{callee}({арги})"
+        if k == "CStyleCastExpr" and n.get("castKind") == "ToVoid" and вн:
+            # «(void)f()» — значение отбрасывается: в Konda вызов-оператор и так
+            # его отбрасывает (каста к «ничего» нет).
+            return self.выражение(вн[0])
+        if k == "MaterializeTemporaryExpr" and вн:
+            return self.выражение(вн[0])     # «f(…).поле» — временное прозрачно
+        if k == "StmtExpr" and вн:
+            подставленное = self._свернуть_stmt_expr(n)
+            if подставленное is not None:
+                return self.выражение(подставленное)
+        if k == "GenericSelectionExpr":
+            # C11 «_Generic(x, T: e, …)»: clang уже выбрал ассоциацию (selected) —
+            # переводим её выражение.
+            for асс in n.get("inner", []):
+                if isinstance(асс, dict) and асс.get("selected"):
+                    выр = [c for c in асс.get("inner", []) if isinstance(c, dict)
+                           and c.get("kind") and not c.get("kind", "").endswith("Type")]
+                    if выр:
+                        return self.выражение(выр[-1])
         if k == "CStyleCastExpr":
             # C container_of («wl_container_of» и т.п.): «(T*)((char*)p -
             # offsetof(T, поле))» → встроенная «контейнер_из<T>(p, поле)» (§121).
@@ -1029,7 +1117,7 @@ class Конвертер:
         т = n.get("type") or {}
         return без_квалификаторов(т.get("desugaredQualType") or т.get("qualType", ""))
 
-    def _контейнер(self, n):
+    def _контейнер(self, n, подсказка=None):
         """C container_of: «(T*)((char*)(p) - offsetof(T, поле))» → (C-тип T,
         узел p, имя поля) или None. clang JSON не хранит поле у OffsetOfExpr —
         берём ЕДИНСТВЕННОЕ поле T того же типа, что и объект под p (звено
@@ -1063,6 +1151,27 @@ class Конвертер:
         поля = [п.get("name") for п in запись.get("inner", [])
                 if п.get("kind") == "FieldDecl"
                 and self._развёрнутый_тип(п) == звено_т and п.get("name")]
+        if len(поля) > 1:
+            # Несколько звеньев одного типа (struct input: link, touch_point_list…):
+            # поле видно в самом указателе «x->ПОЛЕ.next»/«&x->ПОЛЕ» — берём его.
+            у = self._снять_обёртки(указатель)
+            if у.get("kind") == "UnaryOperator" and у.get("opcode") == "&" and у.get("inner"):
+                у = self._снять_обёртки(у["inner"][0])
+            elif у.get("kind") == "MemberExpr" and у.get("name") in ("next", "prev") \
+                    and у.get("inner"):
+                у = self._снять_обёртки(у["inner"][0])
+            if подсказка not in поля:
+                подсказка = у.get("name") if у.get("kind") == "MemberExpr" else None
+            if подсказка not in поля:
+                # Имя поля — последний аргумент макроса в C-строке узла:
+                # «container_of(task, struct window, close_task)».
+                стр = self.строка_c(n) or ""
+                кандидаты = {m.group(1) for m in re.finditer(
+                    r"container_of\s*\([^;]*?,\s*([^\W\d]\w*)\s*\)", стр)} & set(поля)
+                if len(кандидаты) == 1:
+                    подсказка = кандидаты.pop()
+            if подсказка in поля:
+                поля = [подсказка]
         if len(поля) != 1:
             return None
         return тип_т, указатель, поля[0]
@@ -1108,7 +1217,7 @@ class Конвертер:
 
         def шаг_контейнера(x, база_проверка):
             """CONT(<база>->поле.dir) или CONT(Г->dir) → (dir, тип_т) или None."""
-            к = self._контейнер(self._снять_обёртки(x))
+            к = self._контейнер(self._снять_обёртки(x), подсказка=поле)
             if к is None or к[2] != поле:
                 return None
             тип_т, указатель, _ = к
@@ -1377,6 +1486,39 @@ class Конвертер:
             self.внутри_небезопасно = False
             self.эмит(ур, "}")
 
+    def _свернуть_stmt_expr(self, n):
+        """GNU «({ T a = e1; …; итог; })», где перед итоговым выражением — только
+        объявления-временные с инициализатором (container_of weston:
+        «({ const typeof(…) *__mptr = (ptr); (type *)((char *)__mptr - offsetof(…)); })»)
+        → итоговое выражение с подставленными e1… (копия AST) или None."""
+        блок = (n.get("inner") or [None])[0]
+        дети = блок.get("inner", []) if isinstance(блок, dict) else []
+        if not дети or дети[-1].get("kind", "").endswith("Stmt"):
+            return None
+        подстановки = {}
+        for с in дети[:-1]:
+            вар = с.get("inner", []) if с.get("kind") == "DeclStmt" else []
+            if len(вар) != 1 or вар[0].get("kind") != "VarDecl":
+                return None
+            иниц = [x for x in вар[0].get("inner", []) if isinstance(x, dict)
+                    and x.get("kind") and "Attr" not in x.get("kind", "")]
+            if not иниц:
+                return None
+            подстановки[str(вар[0].get("id")).split("_", 1)[-1]] = иниц[-1]
+        итог = copy.deepcopy(дети[-1])
+
+        def заменить(x):
+            if not isinstance(x, dict):
+                return x
+            if x.get("kind") == "DeclRefExpr":
+                ид = str((x.get("referencedDecl") or {}).get("id")).split("_", 1)[-1]
+                if ид in подстановки:
+                    return {"kind": "ParenExpr", "type": x.get("type"),
+                            "inner": [copy.deepcopy(подстановки[ид])]}
+            x["inner"] = [заменить(c) for c in x.get("inner", [])]
+            return x
+        return заменить(итог)
+
     def _вынести_присваивание(self, n, вн):
         """Вложенное «x = v» → строка «x = v» ПЕРЕД оператором, значение — «x».
         Нельзя в условной позиции (правый операнд «и»/«или», ветвь «?:») и в
@@ -1564,14 +1706,17 @@ class Конвертер:
     def _размер_типа(тип) -> str:
         """clang-тип ({qualType, desugaredQualType}) → Konda-выражение размера:
         «размер_обьекта(T)» или «размер_обьекта(T) * N * M» для массива."""
-        qt = без_квалификаторов(тип.get("qualType", "int") if isinstance(тип, dict)
-                                else str(тип))
+        qt = без_квалификаторов(_развернуть_типедеф_массива(
+            тип.get("qualType", "int") if isinstance(тип, dict) else str(тип)))
         м = re.fullmatch(r"(.*?)\s*((?:\[\d+\])+)", qt)
         if м is None and isinstance(тип, dict) and тип.get("desugaredQualType"):
             # typedef массива («typedef float матрица[16]») — размерности в
             # развёрнутом типе.
             м = re.fullmatch(r"(.*?)\s*((?:\[\d+\])+)",
                              без_квалификаторов(тип["desugaredQualType"]))
+        if м is None and qt in МАССИВЫ_ТИПЕДЕФОВ:     # «sizeof(vec3)» — сам typedef
+            qt = _развернуть_типедеф_массива(qt)
+            м = re.fullmatch(r"(.*?)\s*((?:\[\d+\])+)", qt)
         if м is None:
             return f"размер_обьекта({конда_тип(qt)})"
         база, размерности = м.group(1), re.findall(r"\[(\d+)\]", м.group(2))
@@ -2336,12 +2481,19 @@ class Конвертер:
                 return True
         return False
 
-    def _декомпоз_иниц_структуры(self, префикс_путь, имя_стр, иниц, ур):
+    def _декомпоз_иниц_структуры(self, префикс_путь, имя_стр, иниц, ур, через_союз=False):
         """«имя = { поле = знач, вложенное = {…} }» → «имя.поле = знач; …»
         (плоские присваивания). Позиционные элементы сопоставляются полям по
         индексу (порядок self.поля_структур), именованные — по имени."""
         поля = self.поля_структур.get(имя_стр, [])
         типы_полей = self.типы_полей.get(имя_стр, [])
+        через_союз = через_союз or имя_стр in self.союзы
+
+        def присвоить(строка):
+            # Запись в член union — type confusion, только «небезопасно» (§2).
+            if через_союз and not self.внутри_небезопасно:
+                строка = f"небезопасно {{ {строка} }}"
+            self.эмит(ур, строка)
         вн = [c for c in иниц.get("inner", []) if isinstance(c, dict) and "kind" in c and not c.get("kind", "").endswith("Comment")]
         for i, значение in enumerate(вн):
             if i >= len(поля):
@@ -2350,10 +2502,22 @@ class Конвертер:
             путь = f"{префикс_путь}.{имя_поля}"
             если_нестед = значение.get("kind") == "InitListExpr"
             тип_поля = типы_полей[i][1] if i < len(типы_полей) else ""
-            if если_нестед and тип_поля in self.поля_структур:
-                self._декомпоз_иниц_структуры(путь, тип_поля, значение, ур)
+            массив_поля = типы_полей[i][2] if i < len(типы_полей) else None
+            if если_нестед and массив_поля is not None:
+                # Поле-массив «float32 = {0, 0, 0, 1}» → поэлементно (литерала
+                # массива справа от присваивания в Konda нет).
+                элементы = [c for c in значение.get("inner", []) if isinstance(c, dict)
+                            and "kind" in c and not c.get("kind", "").endswith("Comment")]
+                for j, эл in enumerate(элементы):
+                    if эл.get("kind") == "InitListExpr" and тип_поля in self.поля_структур:
+                        self._декомпоз_иниц_структуры(f"{путь}[{j}]", тип_поля, эл, ур,
+                                                      через_союз)
+                    elif эл.get("kind") != "ImplicitValueInitExpr":
+                        присвоить(f"{путь}[{j}] = {self.выражение(эл)}")
+            elif если_нестед and тип_поля in self.поля_структур:
+                self._декомпоз_иниц_структуры(путь, тип_поля, значение, ур, через_союз)
             else:
-                self.эмит(ур, f"{путь} = {self.выражение(значение)}")
+                присвоить(f"{путь} = {self.выражение(значение)}")
 
     def _собрать_буферы(self, тело):
         """Имена указателей, которые в функции РЕАЛЛОЦИРУЮТСЯ («p = realloc(p,…)»
@@ -3169,8 +3333,9 @@ class Конвертер:
     def typedef(self, d):
         имя = d.get("name", "?")
         qt = qualtype(d)
-        # typedef указателя на функцию → типфункции
-        m = re.match(r"(.+?)\(\*\)\((.*)\)$", без_квалификаторов(qt))
+        # typedef указателя на функцию (и самого функционального типа) → типфункции
+        m = re.match(r"(.+?)\(\*\)\((.*)\)$", без_квалификаторов(qt)) \
+            or _ТИП_ФУНКЦИИ.match(без_квалификаторов(qt))
         if m:
             возврат = конда_тип(m.group(1).strip())
             параметры = [p.strip() for p in m.group(2).split(",") if p.strip() and p.strip() != "void"]
@@ -3178,17 +3343,11 @@ class Конвертер:
             self._строка(f"типфункции {возврат} {имя}({птипы})")
             self._строка("")
             return
-        # typedef struct/enum — имя уже доступно; для простого псевдонима — пометка
-        основа = без_квалификаторов(qt)
-        if основа.startswith(("struct ", "union ", "enum ")):
-            return                              # struct X {…} typedef — структура уже вышла
-        # Псевдоним примитива/массива (typedef float GLfloat): в Konda alias для
-        # примитива нет. Использования пока НЕ разворачиваются (это потребовало бы
-        # десугаринга типов по всему файлу — отдельная задача), поэтому честно
-        # помечаем: тип-псевдоним останется неразрешённым.
-        self.добавить_пометку("typedef-алиас", d,
-                             деталь=f"«{имя}» = «{основа}» → «{конда_тип(qt)}»")
-        self._строка("")
+        # typedef struct/enum — имя уже доступно. Псевдоним примитива/указателя/
+        # массива (typedef float GLfloat; typedef float vec3[3]) в Konda не
+        # объявляется: в Konda псевдонимов типов нет, и kfc разворачивает каждое
+        # использование сам (конда_тип через ТИПЕДЕФЫ_ЗАГОЛОВКОВ, массивы —
+        # _развернуть_типедеф_массива), так что печатать нечего.
 
     _ЦЕЛЫЕ_KONDA = ("целое8", "целое16", "целое32", "целое64", "байт", "логический")
 
@@ -3468,6 +3627,14 @@ class Конвертер:
             self.в_глобальной = False
 
     def _глобальная(self, d, ур=0):
+        # «extern T x;» в .c — лишь объявление: переменную транспилятор видит из
+        # заголовка (§127) или из определения в другом файле проекта. Печатать
+        # нечего (голое «T x» на верхнем уровне — не Konda).
+        if d.get("storageClass") == "extern" and not any(
+                isinstance(c, dict) and "kind" in c
+                and not c.get("kind", "").endswith(("Comment", "Attr"))
+                for c in d.get("inner", [])):
+            return
         # Экземпляр слушателя: «S_сл G = { поле = функция, … }» вместо C-структуры.
         экз = self.сл_экземпляры.get(d.get("name"))
         if экз is not None:
@@ -3939,6 +4106,15 @@ class Конвертер:
         # «перевыделить». Пред-скан тела до эмиссии (решение нужно на объявлении).
         тело_ф = next((c for c in f.get("inner", [])
                        if c.get("kind") == "CompoundStmt"), None)
+        # Вариативное определение «f(fmt, ...)» c va_list в Konda невыразимо —
+        # честная пометка вместо синтаксически невалидного тела.
+        if f.get("variadic") and тело_ф is not None:
+            self.тек_функция = исходное_имя
+            self.добавить_пометку("вариативная-функция", f,
+                                  деталь=f"функция «{исходное_имя}»", ур=0)
+            self.тек_функция = None
+            self._строка("")
+            return
         self.буфер_переменные = self._собрать_буферы(тело_ф) if тело_ф else set()
         self.интрузивные_циклы, self.интрузивные_курсоры = (
             self._собрать_интрузивные_циклы(тело_ф) if тело_ф else ({}, set()))
@@ -4628,6 +4804,178 @@ def сдаться(диаги, к, политика):
             политика.пометки_узлы[узел_id] = ("проверка-транспилятора", None, д.текст)
 
 
+_АНОН_ТИП = re.compile(r"(struct|union|enum) \((?:unnamed|anonymous)(?: (?:struct|union|enum))? at [^)]*\)")
+
+
+def _именовать_анонимные_переменных(декларации):
+    """Анонимная запись как ТИП ПЕРЕМЕННОЙ: «struct { … } ubo;», локальная
+    «static const struct { … } desc[] = …». Konda требует именованный тип верхнего
+    уровня → запись получает имя «<переменная>_т» (тип переменной переписывается),
+    локальная выносится перед своей функцией. Плюс вложенные в запись enum и
+    именованные записи (в C у них файловая область) — перед родителем."""
+    занято = {д.get("name") for д in декларации if isinstance(д, dict) and д.get("name")}
+
+    def новое_имя(основа):
+        имя = f"{основа}_т"
+        while имя in занято:
+            имя += "_"
+        занято.add(имя)
+        return имя
+
+    замены = {}          # точное написание «struct (unnamed struct at f:l:c)» → «struct Имя»
+
+    def назвать(запись, переменные):
+        имя = новое_имя(переменные[0].get("name") or "анон")
+        тег = "union" if запись.get("tagUsed") == "union" else "struct"
+        запись["name"] = имя
+        m = _АНОН_ТИП.search((переменные[0].get("type") or {}).get("qualType", ""))
+        if m:
+            замены[m.group(0)] = f"{тег} {имя}"
+
+    def ссылается(v, запись):
+        qt = (v.get("type") or {}).get("qualType", "")
+        return v.get("kind") == "VarDecl" and _АНОН_ТИП.search(qt) is not None
+
+    # (1) верхний уровень: [RecordDecl без имени][VarDecl этого типа…]
+    i = 0
+    while i < len(декларации):
+        д = декларации[i]
+        if isinstance(д, dict) and д.get("kind") == "RecordDecl" and not д.get("name") \
+                and д.get("completeDefinition"):
+            j = i + 1
+            while j < len(декларации) and ссылается(декларации[j], д):
+                j += 1
+            if j > i + 1:
+                назвать(д, декларации[i + 1:j])
+        i += 1
+
+    # (2) локальные: «DeclStmt [RecordDecl без имени, VarDecl…]» → запись наверх
+    вынести = []          # (функция, запись)
+
+    def обход(n, функция):
+        if not isinstance(n, dict):
+            return
+        if n.get("kind") == "DeclStmt":
+            вн = n.get("inner", [])
+            if len(вн) >= 2 and вн[0].get("kind") == "RecordDecl" \
+                    and not вн[0].get("name") and вн[0].get("completeDefinition") \
+                    and all(ссылается(x, вн[0]) for x in вн[1:]):
+                назвать(вн[0], вн[1:])
+                вынести.append((функция, вн.pop(0)))
+        for c in n.get("inner", []):
+            обход(c, функция)
+    for д in list(декларации):
+        if isinstance(д, dict) and д.get("kind") == "FunctionDecl":
+            обход(д, д)
+    for функция, запись in вынести:
+        декларации.insert(декларации.index(функция), запись)
+
+    # Тип переписывается ВЕЗДЕ (переменные, выражения, sizeof/argType): у каждой
+    # анонимной записи написание с местом в файле уникально.
+    if замены:
+        def переписать(n):
+            if isinstance(n, dict):
+                for ключ_т in ("type", "argType"):
+                    т = n.get(ключ_т)
+                    if isinstance(т, dict):
+                        for ключ in ("qualType", "desugaredQualType"):
+                            зн = т.get(ключ)
+                            if isinstance(зн, str) and "(" in зн:
+                                for было, стало in замены.items():
+                                    if было in зн:
+                                        зн = зн.replace(было, стало)
+                                т[ключ] = зн
+                for c in n.get("inner", []):
+                    переписать(c)
+        for д in декларации:
+            переписать(д)
+
+    # (3) вложенные в запись enum (любые) и именованные записи → перед родителем
+    i = 0
+    while i < len(декларации):
+        д = декларации[i]
+        if isinstance(д, dict) and д.get("kind") == "RecordDecl":
+            вн = д.get("inner", [])
+            поднятые = [c for c in вн if isinstance(c, dict) and (
+                c.get("kind") == "EnumDecl"
+                or (c.get("kind") == "RecordDecl" and c.get("name")
+                    and c.get("completeDefinition")))]
+            if поднятые:
+                д["inner"] = [c for c in вн if c not in поднятые]
+                for c in поднятые:
+                    c["_заголовок"] = д.get("_заголовок")
+                декларации[i:i] = поднятые
+                continue          # поднятые записи тоже проверим на вложенность
+        i += 1
+
+
+def _свернуть_размеры_vla(декларации):
+    """«EGLint a[(общих + на_плоскость * 4) * 2 + 1]», где имена — «static const
+    int» с литеральным инициализатором: в C это VLA (const-переменная не
+    константа компиляции), clang печатает выражение в типе. Konda массиву нужен
+    числовой размер — вычисляем (имена → значения) и переписываем ТИП во всех
+    узлах функции (объявление, sizeof, индексы)."""
+    def целые_константы(узлы):
+        знач = {}
+        стек = list(узлы)
+        while стек:
+            у = стек.pop()
+            if not isinstance(у, dict):
+                continue
+            if у.get("kind") == "VarDecl" and у.get("name") \
+                    and re.search(r"\bconst\b", (у.get("type") or {}).get("qualType", "")):
+                иниц = [x for x in у.get("inner", []) if isinstance(x, dict) and x.get("kind")]
+                if иниц:
+                    л = иниц[-1]
+                    while л.get("kind") in ("ImplicitCastExpr", "ParenExpr") and л.get("inner"):
+                        л = л["inner"][0]
+                    if л.get("kind") == "IntegerLiteral":
+                        try:
+                            знач[у["name"]] = int(str(л.get("value")), 0)
+                        except ValueError:
+                            pass
+            стек.extend(у.get("inner", []))
+        return знач
+
+    глобальные = целые_константы([д for д in декларации
+                                  if isinstance(д, dict) and д.get("kind") == "VarDecl"])
+
+    def свернуть(текст, знач):
+        def измерение(m):
+            выр = m.group(1)
+            if not re.search(r"[^\W\d]", выр):
+                return m.group(0)
+            подставлено = re.sub(r"[^\W\d]\w*",
+                                 lambda и: str(знач[и.group(0)]) if и.group(0) in знач else "?",
+                                 выр)
+            if "?" in подставлено or not re.fullmatch(r"[0-9+\-*/%() <>]+", подставлено):
+                return m.group(0)
+            try:
+                return f"[{int(eval(подставлено.replace('/', '//'), {'__builtins__': {}}))}]"
+            except Exception:
+                return m.group(0)
+        return re.sub(r"\[([^\[\]]+)\]", измерение, текст)
+
+    def переписать(n, знач):
+        if not isinstance(n, dict):
+            return
+        for ключ_т in ("type", "argType"):
+            т = n.get(ключ_т)
+            if isinstance(т, dict):
+                for ключ in ("qualType", "desugaredQualType"):
+                    зн = т.get(ключ)
+                    if isinstance(зн, str) and "[" in зн and re.search(r"\[[^\]]*[^\W\d]", зн):
+                        т[ключ] = свернуть(зн, знач)
+        for c in n.get("inner", []):
+            переписать(c, знач)
+
+    for д in декларации:
+        if isinstance(д, dict) and д.get("kind") == "FunctionDecl":
+            знач = dict(глобальные)
+            знач.update(целые_константы([д]))
+            переписать(д, знач)
+
+
 def _именовать_анонимные(декларации):
     """Идиома C «typedef struct {…} Имя;»: тег анонимен, имя даёт typedef.
     Переносим имя typedef на саму struct/enum — Konda объявит «структура Имя».
@@ -5032,6 +5380,19 @@ def _подставить_алиасы_адресов(декларации):
             блок(д)
 
 
+def _скобки_парные(т):
+    """«(…)» целиком — одна пара внешних скобок (а не «(a)(b)»)."""
+    ур = 0
+    for i, c in enumerate(т):
+        if c == "(":
+            ур += 1
+        elif c == ")":
+            ур -= 1
+            if ур == 0 and i != len(т) - 1:
+                return False
+    return ур == 0
+
+
 def _перепривязать_id(узлы, префикс):
     """Уникализирует id узлов clang между файлами проекта: id — это адреса
     памяти clang и МОГУТ совпасть между независимыми запусками, а политика
@@ -5136,15 +5497,21 @@ class Единица:
             # Функции ЗАГОЛОВКОВ — кандидаты во «внешняя» (и прототипы, и
             # static inline с телом); функции самого .c отсеются позже — они
             # «определённые» в проекте и переводятся обычным путём.
-            if k == "TypedefDecl" and тек_файл and (
-                    тек_файл.startswith("/usr") or тек_файл.startswith("<")):
+            # typedef скаляра/enum/указателя-на-запись — из ЛЮБОГО файла (в т.ч.
+            # самого .c: «typedef struct char_sub *character_set») разворачивается
+            # конда_тип'ом; typedef записей и указателей на функцию не трогаем.
+            if k == "TypedefDecl":
                 _учесть_типедеф_заголовка(c)
+            if k == "TypedefDecl":
+                _учесть_типедеф_массива(c)
             if k == "FunctionDecl" and имя_у not in self.все_прототипы:
                 self.все_прототипы[имя_у] = (c, тек_файл)
             elif k in ("RecordDecl", "EnumDecl") and c.get("completeDefinition") \
                     and имя_у not in self.все_типы:
                 self.все_типы[имя_у] = c
         _именовать_анонимные(self.декларации)
+        _именовать_анонимные_переменных(self.декларации)
+        _свернуть_размеры_vla(self.декларации)
         _поднять_вложенные_аноним_записи(self.декларации)
         _подставить_алиасы_адресов(self.декларации)
         _перепривязать_id(self.декларации, f"ф{номер}_")
@@ -5345,6 +5712,10 @@ def собрать_внешние_прототипы(единицы, все_де
         имя_вт = _имя_польз_типа(возврат_qt)   # возврат_qt посчитан выше (до skip)
         if имя_вт:
             указ_имена.add(имя_вт)
+        if возврат_qt in ТИПФУНКЦИИ_ЗАГОЛОВКОВ:
+            # Возврат — typedef указателя на функцию («__sighandler_t signal(…)»):
+            # его «типфункции» добавит замыкание типов (с дедупликацией).
+            реф_типы[id(е)].add(возврат_qt)
         возврат = конда_тип(возврат_qt)
         по_единице[id(е)].append(
             (имя, f"внешняя {возврат} {имя}(" + ", ".join(части) + ")"))
@@ -5423,6 +5794,9 @@ def замкнуть_типы(единицы, реф_типы=None):
             if имя_т not in известные and имя_т in е.все_типы:
                 известные.add(имя_т)
                 добавить(е.все_типы[имя_т])
+            elif имя_т not in известные and имя_т in ТИПФУНКЦИИ_ЗАГОЛОВКОВ:
+                известные.add(имя_т)
+                е.декларации.insert(0, ТИПФУНКЦИИ_ЗАГОЛОВКОВ[имя_т])
         while очередь:
             д = очередь.pop()
             for поле in д.get("inner", []):
